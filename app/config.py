@@ -65,3 +65,8 @@ ERP_ATTENDANCE_URL = "https://j7lo9j074j.execute-api.ap-south-1.amazonaws.com/at
 ERP_USER_MAP = {
     "rhythm": 72
 }
+
+#Confirmation
+ATTEND_AUTO_THRESHOLD = 0.75  # >= this → auto mark
+ATTEND_MAYBE_THRESHOLD = 0.60 # between this and AUTO → ask confirmation
+TOP_K = 3                     # already in your config, used for candidates

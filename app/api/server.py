@@ -2,8 +2,12 @@ import logging
 import time
 import cv2
 import numpy as np
+import os
+import json
+import io
+from typing import Optional, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Query
+from fastapi import FastAPI, UploadFile, File, Query, Form
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.requests import Request
@@ -11,15 +15,81 @@ from starlette.requests import Request
 from app.logging_config import setup_logging
 from app.core.recognize import Pipeline
 
-from fastapi import Form
-
-# ── Setup logging & app ─────────────────────────────────────────
+# ─────────────── Setup ────────────────
 setup_logging()
 app = FastAPI(title="Attendance Face API")
 log = logging.getLogger(__name__)
 PIPE = Pipeline()
 
-# ── HTTP request/response logging middleware ───────────────────
+# ───────────── Firebase Setup ─────────────
+firebase_initialized = False
+firebase_bucket = None
+firebase_error: str | None = None  # capture init error (if any)
+
+def _load_bucket_from_google_services(gs_path: str = "google-services.json") -> Optional[str]:
+    """Read bucket name from google-services.json if available."""
+    if not os.path.exists(gs_path):
+        return None
+    with open(gs_path, "r") as f:
+        cfg = json.load(f)
+    try:
+        return cfg["project_info"]["storage_bucket"]
+    except Exception:
+        return None
+
+def init_firebase_once():
+    """Initialize Firebase Admin using credentials + bucket."""
+    global firebase_initialized, firebase_bucket
+    if firebase_initialized:
+        return
+
+    cred_path = os.getenv("FIREBASE_CREDENTIALS_FILE")  # path to firebase_service.json
+    if not cred_path or not os.path.exists(cred_path):
+        raise RuntimeError("FIREBASE_CREDENTIALS_FILE not set or file not found.")
+
+    bucket_name = os.getenv("FIREBASE_BUCKET") or _load_bucket_from_google_services()
+    if not bucket_name:
+        raise RuntimeError("No Firebase bucket configured. Set FIREBASE_BUCKET or include google-services.json.")
+
+    import firebase_admin
+    from firebase_admin import credentials, storage
+
+    cred = credentials.Certificate(cred_path)
+    firebase_admin.initialize_app(cred, {"storageBucket": bucket_name})
+    firebase_bucket = storage.bucket()
+    firebase_initialized = True
+    logging.getLogger(__name__).info(f"Firebase initialized with bucket={bucket_name}")
+
+def firebase_upload_bytes(
+    folder_path: str,
+    filename: str,
+    data: bytes,
+    content_type: str = "image/jpeg",
+) -> Tuple[str, str]:
+    """Upload bytes to Firebase Storage."""
+    init_firebase_once()
+    blob_path = f"{folder_path.rstrip('/')}/{filename}"
+    blob = firebase_bucket.blob(blob_path)
+    blob.upload_from_file(io.BytesIO(data), content_type=content_type)
+    try:
+        blob.make_public()  # may fail if Uniform Bucket-Level Access is on
+        public_url = blob.public_url
+    except Exception:
+        public_url = ""
+    gs_url = f"gs://{firebase_bucket.name}/{blob_path}"
+    return gs_url, public_url
+
+# ───────────── Init on startup ─────────────
+@app.on_event("startup")
+def _startup_init_firebase():
+    global firebase_error
+    try:
+        init_firebase_once()
+    except Exception as e:
+        firebase_error = f"{type(e).__name__}: {e}"
+        logging.getLogger(__name__).warning(f"Firebase init failed on startup: {firebase_error}")
+
+# ───────────── Middleware ─────────────
 @app.middleware("http")
 async def http_logger(request: Request, call_next):
     start = time.perf_counter()
@@ -48,7 +118,7 @@ async def http_logger(request: Request, call_next):
         )
         raise
 
-# ── Always return JSON for errors ───────────────────────────────
+# ───────────── Errors ─────────────
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"error": "validation_error", "details": exc.errors()})
@@ -58,228 +128,57 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     logging.getLogger("app.api.server").exception("unhandled_exception")
     return JSONResponse(status_code=500, content={"error": str(exc)})
 
-# ── Helpers ────────────────────────────────────────────────────
-def _read_img_from_upload(file: UploadFile) -> np.ndarray:
-    raw = file.file.read()
-    if not raw:
-        raise ValueError(f"Empty image upload: {getattr(file, 'filename', None)}")
-    arr = np.frombuffer(raw, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError(f"Invalid image upload: {getattr(file, 'filename', None)} bytes={len(raw)}")
-    return img
-
-# ── Endpoints ──────────────────────────────────────────────────
+# ───────────── Health ─────────────
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "people": PIPE.db.people()}
-
-@app.post("/attendance/mark")
-async def attendance_mark(
-    file: UploadFile = File(...),
-    confirm_user_id: str | None = Form(None),  # optional override from app
-):
-    """
-    One-shot attendance from a single frame.
-
-    - If confirm_user_id is provided, we mark attendance for that user_id directly.
-    - Else we run recognition:
-        * similarity >= ATTEND_AUTO_THRESHOLD  -> auto mark
-        * ATTEND_MAYBE_THRESHOLD..AUTO         -> ask client to confirm (return candidates)
-        * below MAYBE or unknown               -> no_match
-    Returns JSON with status and details so app knows who was marked (or to confirm).
-    """
-    from app.clients.http import post_json
-    from app import config
-
-    try:
-        raw = file.file.read()
-        if not raw:
-            return JSONResponse(status_code=400, content={"error": "Empty image upload"})
-
-        log.info(
-            "att_mark_in",
-            extra={
-                "upload_filename": getattr(file, "filename", None),
-                "bytes": len(raw),
-                "content_type": getattr(file, "content_type", None),
-                "confirm_user_id": confirm_user_id,
-            },
-        )
-
-        # Decode
-        arr = np.frombuffer(raw, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            return JSONResponse(status_code=400, content={"error": "Invalid image"})
-
-        # Helper to convert any local person_id to ERP user_id (int), using map if needed
-        def to_erp_user_id(pid: str) -> int | None:
-            try:
-                return int(pid)
-            except Exception:
-                return getattr(config, "ERP_USER_MAP", {}).get(pid)
-
-        # If client already confirmed a user_id, mark straight away
-        if confirm_user_id:
-            erp_uid = to_erp_user_id(confirm_user_id)
-            if erp_uid is None:
-                return {"status": "error", "message": f"Invalid or unmapped confirm_user_id: {confirm_user_id}"}
-            payload = {"user_id": erp_uid}
-            status, resp = await post_json(config.ERP_ATTENDANCE_URL, payload)
-            log.info("att_mark_confirmed", extra={"confirm_user_id": confirm_user_id, "erp_uid": erp_uid, "status": status, "resp": resp})
-            return {
-                "status": "marked",
-                "chosen_user_id": confirm_user_id,
-                "erp_user_id": erp_uid,
-                "attendance": resp,
-                "message": "Attendance marked via confirmation."
-            }
-
-        # Run recognition
-        preds = PIPE.recognize_image(img)  # your existing pipeline
-        if not preds:
-            return {"status": "no_face", "message": "No face detected."}
-
-        best = preds[0]  # top detection by score
-        best_pid = best["prediction"]["person_id"]
-        best_sim = float(best["prediction"]["similarity"])
-        top_k = best.get("top_k", [])  # list of {person_id, score}
-
-        auto_thr  = float(getattr(config, "ATTEND_AUTO_THRESHOLD", 0.75))
-        maybe_thr = float(getattr(config, "ATTEND_MAYBE_THRESHOLD", 0.60))
-
-        # Unknown or very low similarity → no match
-        if best_pid == "unknown" or best_sim < maybe_thr:
-            return {
-                "status": "no_match",
-                "best": {"person_id": best_pid, "similarity": best_sim},
-                "candidates": top_k[: int(getattr(config, "TOP_K", 3))],
-                "message": "Face not confidently recognized.",
-            }
-
-        # High confidence → auto mark attendance
-        if best_sim >= auto_thr:
-            erp_uid = to_erp_user_id(best_pid)
-            if erp_uid is None:
-                # We recognized locally but can't map to ERP → ask client to confirm / map
-                return {
-                    "status": "needs_confirmation",
-                    "best": {"person_id": best_pid, "similarity": best_sim},
-                    "candidates": top_k[: int(getattr(config, "TOP_K", 3))],
-                    "message": f"ERP mapping missing for '{best_pid}'. Provide confirm_user_id to mark.",
-                }
-            payload = {"user_id": erp_uid}
-            status, resp = await post_json(config.ERP_ATTENDANCE_URL, payload)
-            log.info("att_mark_auto", extra={"person_id": best_pid, "erp_uid": erp_uid, "similarity": best_sim, "status": status, "resp": resp})
-            return {
-                "status": "marked",
-                "best": {"person_id": best_pid, "similarity": best_sim},
-                "erp_user_id": erp_uid,
-                "attendance": resp,
-                "message": "Attendance marked automatically.",
-            }
-
-        # Medium confidence → require client confirmation
-        return {
-            "status": "needs_confirmation",
-            "best": {"person_id": best_pid, "similarity": best_sim},
-            "candidates": top_k[: int(getattr(config, "TOP_K", 3))],
-            "message": "Please confirm the correct person_id.",
-        }
-
-    except Exception as e:
-        log.exception("att_mark_failed", extra={"error": str(e)})
-        return JSONResponse(status_code=400, content={"error": str(e)})
-@app.post("/enroll")
-async def enroll(person_id: str = Query(...), files: list[UploadFile] = File(...)):
-    log.info("api_enroll_in", extra={"person_id": person_id, "files": [getattr(f, "filename", None) for f in files]})
-    total_faces = total_emb = 0
-    for f in files:
+    # Lazy init if reload happened after startup
+    global firebase_error
+    if not firebase_initialized and firebase_error is None:
         try:
-            raw = f.file.read()
-            log.info(
-                "upload_info",
-                extra={
-                    "upload_filename": getattr(f, "filename", None),
-                    "size_bytes": len(raw) if raw else 0,
-                    "content_type": getattr(f, "content_type", None),
-                },
-            )
-            arr = np.frombuffer(raw, np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is None:
-                raise ValueError(f"Invalid image upload {getattr(f, 'filename', None)}")
-            res = PIPE.enroll_image(img, person_id, getattr(f, "filename", None) or "upload")
-            total_faces += res["faces"]
-            total_emb += res["embeddings_added"]
+            init_firebase_once()
         except Exception as e:
-            log.exception("enroll_failed", extra={"file": getattr(f, "filename", None)})
-            return JSONResponse(status_code=400, content={"error": str(e)})
-    log.info("api_enroll_out", extra={"person_id": person_id, "faces": total_faces, "embeddings": total_emb})
-    return {"person_id": person_id, "faces": total_faces, "embeddings": total_emb}
+            firebase_error = f"{type(e).__name__}: {e}"
 
-@app.post("/enroll/video")
-async def enroll_video(person_id: str = Query(...), video: UploadFile = File(...)):
-    try:
-        raw = video.file.read()
-        if not raw:
-            return JSONResponse(status_code=400, content={"error": "Empty video upload"})
-        log.info(
-            "api_video_in",
-            extra={
-                "person_id": person_id,
-                "upload_filename": getattr(video, "filename", None),
-                "size_bytes": len(raw),
-                "content_type": getattr(video, "content_type", None),
-            },
-        )
-        res = PIPE.enroll_video(raw, person_id=person_id, source=(getattr(video, "filename", None) or "video"))
-        log.info("api_video_out", extra={"person_id": person_id, **res})
-        return {"person_id": person_id, **res}
-    except Exception as e:
-        log.exception("enroll_video_failed", extra={"file": getattr(video, "filename", None)})
-        return JSONResponse(status_code=400, content={"error": str(e)})
-from fastapi import Form  # add at top with other imports
+    bucket_name = getattr(firebase_bucket, "name", None)
+    return {
+        "status": "ok",
+        "firebase_ready": firebase_initialized,
+        "firebase_bucket": bucket_name,
+        "firebase_error": firebase_error,
+        "env_seen": {
+            "FIREBASE_CREDENTIALS_FILE": os.environ.get("FIREBASE_CREDENTIALS_FILE"),
+            "FIREBASE_BUCKET": os.environ.get("FIREBASE_BUCKET"),
+        },
+        "people": PIPE.db.people(),
+    }
 
+# ───────────── Register Endpoint ─────────────
 @app.post("/register")
 async def register(
     name: str = Form(""),
     user_id: str = Form(...),
     files: list[UploadFile] = File(...),
-    max_images: int = Query(20, ge=1, le=200),  # keep in sync with app
+    max_images: int = Query(20, ge=1, le=200),
 ):
-    """
-    Receive pre-cut frames from the app, preprocess (detect+align), embed, and store.
-    - person_id is set to user_id (string safe); if numeric, you can map later to ERP.
-    - returns a summary with how many faces/embeddings were created.
-    """
     from app import config
-
     person_id = str(user_id).strip()
     if not person_id:
         return JSONResponse(status_code=400, content={"error": "user_id required"})
-
     if not files:
         return JSONResponse(status_code=400, content={"error": "No files[] received"})
 
-    # hard cap to protect server; app already caps at 20
+    # Initialize Firebase once (no-op if already initialized)
+    try:
+        init_firebase_once()
+    except Exception as e:
+        # still allow local enroll, but surface error
+        logging.getLogger(__name__).warning(f"Firebase init on /register failed: {e}")
+
     cap = min(max_images, getattr(config, "MAX_IMAGES", max_images))
+    total_faces = total_emb = processed = errors = 0
+    uploaded = []
 
-    log.info(
-        "api_register_in",
-        extra={
-            "person_id": person_id,
-            "person_name": name,
-            "files_count": len(files),
-            "cap": cap,
-        },
-    )
-
-    total_faces = 0
-    total_emb = 0
-    processed = 0
-    errors = 0
+    log.info("api_register_in", extra={"person_id": person_id, "person_name": name, "files_count": len(files), "cap": cap})
 
     for i, f in enumerate(files[:cap], start=1):
         try:
@@ -289,6 +188,22 @@ async def register(
                 log.warning("register_empty_file", extra={"idx": i, "upload_filename": getattr(f, "filename", None)})
                 continue
 
+            safe_name = getattr(f, "filename", f"frame_{i:04d}.jpg")
+            folder = f"users/{person_id}/raw"
+
+            # Upload to Firebase (if initialized)
+            if firebase_initialized:
+                try:
+                    gs_url, public_url = firebase_upload_bytes(
+                        folder, safe_name, raw,
+                        content_type=getattr(f, "content_type", "image/jpeg"),
+                    )
+                    uploaded.append({"file": safe_name, "gs_url": gs_url, "public_url": public_url})
+                except Exception as up_e:
+                    errors += 1
+                    log.exception("firebase_upload_failed", extra={"idx": i, "file": safe_name, "error": str(up_e)})
+
+            # Enroll locally
             arr = np.frombuffer(raw, np.uint8)
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if img is None:
@@ -296,15 +211,14 @@ async def register(
                 log.warning("register_decode_fail", extra={"idx": i, "upload_filename": getattr(f, "filename", None)})
                 continue
 
-            # Reuse your existing single-image enrollment path
-            res = PIPE.enroll_image(img, person_id=person_id, source=(getattr(f, "filename", None) or f"frame_{i:04d}.jpg"))
+            res = PIPE.enroll_image(img, person_id=person_id, source=safe_name)
             total_faces += int(res.get("faces", 0))
             total_emb  += int(res.get("embeddings_added", 0))
             processed  += 1
 
         except Exception as e:
             errors += 1
-            log.exception("register_frame_error", extra={"idx": i, "upload_filename": getattr(f, "filename", None), "error": str(e)})
+            log.exception("register_frame_error", extra={"idx": i, "error": str(e)})
 
     summary = {
         "ok": True,
@@ -315,117 +229,97 @@ async def register(
         "errors": errors,
         "faces_detected": total_faces,
         "embeddings_added": total_emb,
-        "capped_at": cap,
+        "uploaded": uploaded,
     }
-
     log.info("api_register_out", extra=summary)
     return summary
 
-@app.post("/capture/video")
-async def capture_video(
-    person_id: str = Query(..., description="Employee/Person ID"),
-    video: UploadFile = File(...),
-    sample_every: int = Query(5, ge=1, le=60),
-    max_frames: int = Query(150, ge=1, le=2000),
-    min_face_px: int = Query(120, ge=60, le=1000),
-):
+# ───────────── Mark Attendance ─────────────
+@app.post("/mark_attendance")
+async def mark_attendance(file: UploadFile = File(...), confirm_user_id: str | None = Form(None)):
     """
-    Accept a video, extract frames at a constant rate, DETECT+ALIGN faces,
-    save aligned crops, and return pose coverage + next UI instruction.
+    - If confirm_user_id is provided, mark for that user directly (no ERP posting).
+    - Else run recognition via Pipeline.
     """
-    try:
-        raw = video.file.read()
-        if not raw:
-            return JSONResponse(status_code=400, content={"error": "Empty video upload"})
-        log.info(
-            "api_capture_in",
-            extra={
-                "person_id": person_id,
-                "upload_filename": getattr(video, "filename", None),
-                "size_bytes": len(raw),
-                "content_type": getattr(video, "content_type", None),
-                "sample_every": sample_every,
-                "max_frames": max_frames,
-                "min_face_px": min_face_px,
-            },
-        )
-        from app.core.capture import save_aligned_frames_from_video
-        res = save_aligned_frames_from_video(
-            raw,
-            person_id=person_id,
-            sample_every=sample_every,
-            max_frames=max_frames,
-            min_face_px=min_face_px,
-        )
-        log.info("api_capture_out", extra={"person_id": person_id, **res})
-        return res
-    except Exception as e:
-        log.exception(
-            "capture_video_failed",
-            extra={"file": getattr(video, "filename", None), "error": str(e)},
-        )
-        return JSONResponse(status_code=400, content={"error": str(e)})
-
-
-@app.post("/recognize")
-async def recognize(file: UploadFile = File(...)):
-    from app.clients.http import post_json
-    from app import config
-
     try:
         raw = file.file.read()
-        log.info(
-            "api_rec_in",
-            extra={
-                "upload_filename": getattr(file, "filename", None),
-                "size_bytes": len(raw) if raw else 0,
-                "content_type": getattr(file, "content_type", None),
-            },
-        )
+        if not raw:
+            return JSONResponse(status_code=400, content={"error": "Empty image upload"})
 
-        # Decode image
         arr = np.frombuffer(raw, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
-            raise ValueError(f"Invalid image upload {getattr(file, 'filename', None)}")
+            return JSONResponse(status_code=400, content={"error": "Invalid image"})
 
-        # Recognize faces
+        # Confirmed user
+        if confirm_user_id:
+            print(f"[CONFIRMATION] Attendance marked for user_id={confirm_user_id}")
+            # --- ERP posting temporarily disabled ---
+            # from app.clients.http import post_json
+            # from app import config
+            # payload = {"user_id": int(confirm_user_id)}
+            # status, resp = await post_json(config.ERP_ATTENDANCE_URL, payload)
+            return {
+                "status": "marked",
+                "chosen_user_id": confirm_user_id,
+                "message": "Attendance marked (local confirmation)."
+            }
+
+        # Run recognition
         preds = PIPE.recognize_image(img)
-        log.info("api_rec_out", extra={"faces": len(preds)})
+        if not preds:
+            return {"status": "no_face", "message": "No face detected."}
 
-        # --- Mark attendance for recognized person ---
-        if preds and preds[0]["prediction"]["person_id"] != "unknown":
-            person_id = preds[0]["prediction"]["person_id"]
-            log.info("attendance_attempt", extra={"person_id": person_id})
+        best = preds[0]
+        best_pid = best["prediction"]["person_id"]
+        best_sim = float(best["prediction"]["similarity"])
+        top_k = best.get("top_k", [])
 
-            # Try to parse numeric ID, fallback to ERP_USER_MAP if defined
-            try:
-                user_id = int(person_id)
-            except ValueError:
-                user_id = getattr(config, "ERP_USER_MAP", {}).get(person_id)
+        auto_thr  = 0.75
+        maybe_thr = 0.60
 
-            if user_id is None:
-                msg = f"No ERP mapping for person_id '{person_id}'"
-                log.warning("attendance_skipped", extra={"reason": msg})
-                return {"faces": preds, "attendance": msg}
+        if best_pid == "unknown" or best_sim < maybe_thr:
+            return {
+                "status": "no_match",
+                "best": {"person_id": best_pid, "similarity": best_sim},
+                "message": "Face not confidently recognized.",
+            }
 
-            # Send attendance request
-            payload = {"user_id": user_id}
-            log.info("attendance_request", extra={"payload": payload})
-            status, resp = await post_json(config.ERP_ATTENDANCE_URL, payload)
-            log.info("attendance_response", extra={"status": status, "resp": resp})
+        if best_sim >= auto_thr:
+            print(f"[AUTO] Recognized {best_pid} (sim={best_sim:.3f}) — marking attendance.")
+            return {
+                "status": "marked",
+                "best": {"person_id": best_pid, "similarity": best_sim},
+                "message": f"Attendance marked automatically for {best_pid}."
+            }
 
-            return {"faces": preds, "attendance": resp}
-
-        return {"faces": preds, "attendance": "no known face detected"}
+        return {
+            "status": "needs_confirmation",
+            "best": {"person_id": best_pid, "similarity": best_sim},
+            "candidates": top_k[:3],
+            "message": "Please confirm the correct person_id."
+        }
 
     except Exception as e:
-        log.exception("recognize_failed", extra={"file": getattr(file, "filename", None)})
+        log.exception("mark_attendance_failed", extra={"error": str(e)})
         return JSONResponse(status_code=400, content={"error": str(e)})
+# add to server.py (near other routes)
+
+@app.post("/debug/firebase_test")
+async def firebase_test(user_id: str = Form(...)):
+    try:
+        init_firebase_once()
+        payload = f"hello from server at {int(time.time())}\n".encode()
+        gs_url, public_url = firebase_upload_bytes(
+            f"users/{user_id}/debug", "ping.txt", payload, content_type="text/plain"
+        )
+        return {"ok": True, "gs_url": gs_url, "public_url": public_url, "bucket": firebase_bucket.name}
+    except Exception as e:
+        log.exception("firebase_test_failed", extra={"error": str(e)})
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
-
-# (Optional) Friendly root
+# ───────────── Root ─────────────
 @app.get("/")
 def root():
-    return {"message": "Attendance Face API", "try": ["/healthz", "/docs", "POST /enroll", "POST /enroll/video", "POST /recognize"]}
+    return {"message": "Attendance Face API", "try": ["/healthz", "POST /register", "POST /mark_attendance"]}
