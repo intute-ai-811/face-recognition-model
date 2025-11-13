@@ -1,7 +1,10 @@
 name: Build, Push & Deploy to VPS
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
+  # (Optional) auto-deploy on pushes to main
+  # push:
+  #   branches: [ "main" ]
 
 concurrency:
   group: face-recognition-api
@@ -14,11 +17,16 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # QEMU not needed since we're only building amd64
+      # Uncomment if you store large models with Git LFS
+      # - name: Pull LFS files
+      #   run: git lfs pull
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -53,44 +61,91 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-and-push
     steps:
-      - name: Deploy to GoDaddy VPS via SSH
-        uses: appleboy/ssh-action@v0.1.7
+      - name: Deploy to GoDaddy VPS via SSH (blue/green + health + long timeout)
+        uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USERNAME }}
           password: ${{ secrets.VPS_PASSWORD }}
           port: 22
           script_stop: true
+          timeout: 60m           # SSH connect timeout
+          command_timeout: 50m   # remote script max runtime
+          debug: true
           envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,REGISTRY,IMAGE_NAME
           script: |
-            set -eo pipefail
+            set -euo pipefail
 
-            echo "Pruning old Docker images and containers..."
-            docker system prune -af --volumes || true
+            IMAGE="${REGISTRY}/${IMAGE_NAME}:latest"
+            NAME="face-recognition-api"
+            CANARY="${NAME}_canary"
+            CANARY_PORT=18000
 
             echo "Logging in to Docker Hub on VPS..."
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-            IMAGE="${REGISTRY}/${IMAGE_NAME}:latest"
-            CONTAINER_NAME="face-recognition-api"
+            echo "Pulling image (quiet)..."
+            docker pull -q "${IMAGE}"
 
-            echo "Pulling image: ${IMAGE}"
-            docker pull "${IMAGE}"
+            echo "Starting canary ${CANARY} on port ${CANARY_PORT}..."
+            docker rm -f "${CANARY}" >/dev/null 2>&1 || true
+            docker run -d --name "${CANARY}" \
+              --restart unless-stopped \
+              -p ${CANARY_PORT}:8000 \
+              "${IMAGE}"
 
-            echo "Stopping/removing existing container if present..."
-            if [ "$(docker ps -aq -f name="^${CONTAINER_NAME}$")" ]; then
-              docker rm -f "${CONTAINER_NAME}" || true
+            echo "Waiting for canary health..."
+            # Wait up to ~2 minutes for /docs to respond
+            for i in $(seq 1 24); do
+              if curl -fsS "http://127.0.0.1:${CANARY_PORT}/docs" >/dev/null; then
+                echo "Canary healthy."
+                break
+              fi
+              sleep 5
+              if [ $i -eq 24 ]; then
+                echo "Canary failed health check. Recent logs:"
+                docker logs --tail=200 "${CANARY}" || true
+                docker rm -f "${CANARY}" || true
+                exit 1
+              fi
+            done
+
+            echo "Stopping/removing existing ${NAME} (if any)..."
+            if docker ps -aq -f name="^${NAME}$" | grep -q .; then
+              docker rm -f "${NAME}" || true
             fi
 
-            echo "Starting new container..."
-            docker run -d \
-              --name "${CONTAINER_NAME}" \
+            echo "Starting final container ${NAME} on :8000..."
+            docker run -d --name "${NAME}" \
               --restart unless-stopped \
               -p 8000:8000 \
               "${IMAGE}"
 
+            echo "Final health check..."
+            for i in $(seq 1 24); do
+              if curl -fsS "http://127.0.0.1:8000/docs" >/dev/null; then
+                echo "Service healthy on :8000"
+                break
+              fi
+              sleep 5
+              if [ $i -eq 24 ]; then
+                echo "Final container failed health check. Logs:"
+                docker logs --tail=200 "${NAME}" || true
+                echo "Rolling back: keeping canary only."
+                docker rm -f "${NAME}" || true
+                # Optionally promote canary to 8000 by re-running it on 8000 (left simple: fail fast)
+                exit 1
+              fi
+            done
+
+            echo "Cleaning up canary..."
+            docker rm -f "${CANARY}" >/dev/null 2>&1 || true
+
+            echo "Pruning old images (safe; keeps running ones)..."
+            docker image prune -f || true
+
             echo "Deployment complete. Current status:"
-            docker ps --filter "name=${CONTAINER_NAME}"
+            docker ps --filter "name=${NAME}"
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
