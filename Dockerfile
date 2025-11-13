@@ -1,6 +1,4 @@
 # syntax=docker/dockerfile:1.7
-
-# Base image with Python
 FROM python:3.11-slim-bookworm
 
 # ---- Environment & runtime tuning ----
@@ -10,61 +8,58 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UVICORN_HOST=0.0.0.0 \
     UVICORN_PORT=8000
 
-# Create a non-root user WITH a real home so libs can cache safely
+# Non-root user
 ARG APP_USER=app
 ARG APP_GROUP=app
 ARG APP_UID=10001
 RUN addgroup --system ${APP_GROUP} \
- && adduser --system --uid ${APP_UID} --ingroup ${APP_GROUP} --home /home/${APP_USER} ${APP_USER}
+ && adduser  --system --uid ${APP_UID} --ingroup ${APP_GROUP} --home /home/${APP_USER} ${APP_USER}
 
-# Set cache locations to writable paths under the user's home
+# Caches
 ENV HOME=/home/${APP_USER} \
     XDG_CACHE_HOME=/home/${APP_USER}/.cache \
     TORCH_HOME=/home/${APP_USER}/.cache/torch
-
-# Ensure cache dirs exist
 RUN mkdir -p "$XDG_CACHE_HOME" "$TORCH_HOME"
 
-# Set a dedicated workdir
 WORKDIR /code
 
-# ---- System deps (opencv/mediapipe/torch helpers) ----
-# libgl1: OpenCV GUI-less requirement
-# libglib2.0-0: OpenCV/mediapipe runtime
-# libsm6, libxext6: often required by cv2 for image ops
-# ffmpeg: for video I/O
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      libgl1 \
-      libglib2.0-0 \
-      libsm6 \
-      libxext6 \
-      ffmpeg \
- && rm -rf /var/lib/apt/lists/*
-
-# ---- Python deps (cache-friendly) ----
-# Copy only requirements first to leverage layer caching
+# ---- Copy only requirements first (better caching) ----
 COPY requirements.txt .
 
-# If you pin heavy libs (torch/torchvision/mediapipe/opencv-python),
-# wheels will be pulled; using BuildKit pip cache speeds up rebuilds.
+# ---- Build & runtime system deps ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential g++ cmake \
+      libgl1 libglib2.0-0 libsm6 libxext6 ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+
+# ---- Python deps ----
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install -r requirements.txt
 
+# Optional: slim the image
+RUN apt-get purge -y --auto-remove build-essential g++ cmake || true && \
+    rm -rf /var/lib/apt/lists/*
+
 # ---- App code ----
-# Copy the rest of your project into /code
-COPY . .
+# Copy source code and models, making sure permissions belong to the app user
+COPY --chown=${APP_USER}:${APP_GROUP} . /code
+# If you want to be explicit (no-op if already present in repo):
+# COPY --chown=${APP_USER}:${APP_GROUP} models/ /code/models/
 
-# Make sure both /code and the user's home (cache dirs) are owned by the non-root user
-RUN chown -R ${APP_USER}:${APP_GROUP} /code /home/${APP_USER}
+# ---- Ensure runtime dirs exist & are writable by the non-root user ----
+# Create /code/data and a default faces subdir so imports that mkdir won't fail
+RUN mkdir -p /code/data/faces /code/models \
+ && chown -R ${APP_USER}:${APP_GROUP} /code /home/${APP_USER}
 
-# Switch to non-root for security
 USER ${APP_USER}
 
-# Expose FastAPI port
 EXPOSE 8000
 
-# Start FastAPI with uvicorn
-# Shell form so env vars expand correctly
-# If your app entry changes, update "app.main:app"
-CMD uvicorn app.main:app --host ${UVICORN_HOST} --port ${UVICORN_PORT}
+# Basic liveness check (adjust path if your API differs)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
+  CMD python -c "import urllib.request as u,sys; \
+    sys.exit(0 if u.urlopen('http://127.0.0.1:8000/docs', timeout=3).status < 500 else 1)" || exit 1
+
+# Start FastAPI
+CMD uvicorn app.api.server:app --host ${UVICORN_HOST} --port ${UVICORN_PORT}
