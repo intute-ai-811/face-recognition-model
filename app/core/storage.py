@@ -11,7 +11,7 @@ import cv2
 from app import config
 from app.logging_config import get_logger, timed
 
-log = get_logger(__name__)
+log = get_logger(_name_)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -34,8 +34,7 @@ class LocalStore:
     Embeddings are stored as pickle (index.pkl), crops as JPEGs.
     """
 
-    def __init__(self):
-        config.FACES_DIR.mkdir(parents=True, exist_ok=True)
+    def _init_(self):
         config.EMBED_DIR.mkdir(parents=True, exist_ok=True)
         self.index_file = config.EMBED_INDEX_FILE
         self._records: list[EmbRecord] = []
@@ -96,14 +95,15 @@ class LocalStore:
 
     # ─────────────────────────────────────────────────────────────
     def save_aligned(self, person_id: str, aligned_bgr: np.ndarray) -> Path:
-        """Save aligned face crop for audit/debugging."""
-        pid_dir = config.FACES_DIR / person_id
-        pid_dir.mkdir(parents=True, exist_ok=True)
-        name = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}.jpg"
-        out = pid_dir / name
-        cv2.imwrite(str(out), aligned_bgr)
-        log.info("save_crop", extra={"person_id": person_id, "path": str(out)})
-        return out
+        """
+        Previously saved aligned face crops to disk.
+        Now a no-op because faces are stored in Firebase via /register.
+        """
+        log.info("save_crop_skipped", extra={"person_id": person_id})
+        # Return a dummy path so existing callers don't break
+        return config.DATA_DIR / "faces" / f"{person_id}_ignored.jpg"
+
+
 
     # ─────────────────────────────────────────────────────────────
     def add_embeddings(self, person_id: str, embs: np.ndarray, source: str) -> int:

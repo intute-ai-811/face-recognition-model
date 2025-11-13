@@ -1,5 +1,4 @@
 # syntax=docker/dockerfile:1.7
-
 FROM python:3.11-slim-bookworm
 
 # ---- Environment & runtime tuning ----
@@ -9,14 +8,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UVICORN_HOST=0.0.0.0 \
     UVICORN_PORT=8000
 
-# Create a non-root user WITH a real home so libs can cache safely
+# Non-root user
 ARG APP_USER=app
 ARG APP_GROUP=app
 ARG APP_UID=10001
 RUN addgroup --system ${APP_GROUP} \
- && adduser --system --uid ${APP_UID} --ingroup ${APP_GROUP} --home /home/${APP_USER} ${APP_USER}
+ && adduser  --system --uid ${APP_UID} --ingroup ${APP_GROUP} --home /home/${APP_USER} ${APP_USER}
 
-# Cache locations
+# Caches
 ENV HOME=/home/${APP_USER} \
     XDG_CACHE_HOME=/home/${APP_USER}/.cache \
     TORCH_HOME=/home/${APP_USER}/.cache/torch
@@ -28,8 +27,6 @@ WORKDIR /code
 COPY requirements.txt .
 
 # ---- Build & runtime system deps ----
-# - build-essential, g++, cmake: required to build insightface C/C++ extension
-# - libgl1, libglib2.0-0, libsm6, libxext6, ffmpeg: common OpenCV/mediapipe runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential g++ cmake \
       libgl1 libglib2.0-0 libsm6 libxext6 ffmpeg \
@@ -40,18 +37,29 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install -r requirements.txt
 
-# Optional: remove heavy build tools after wheels are built to slim the image
+# Optional: slim the image
 RUN apt-get purge -y --auto-remove build-essential g++ cmake || true && \
     rm -rf /var/lib/apt/lists/*
 
 # ---- App code ----
-COPY . .
+# Copy source code and models, making sure permissions belong to the app user
+COPY --chown=${APP_USER}:${APP_GROUP} . /code
+# If you want to be explicit (no-op if already present in repo):
+# COPY --chown=${APP_USER}:${APP_GROUP} models/ /code/models/
 
-# Permissions for non-root user
-RUN chown -R ${APP_USER}:${APP_GROUP} /code /home/${APP_USER}
+# ---- Ensure runtime dirs exist & are writable by the non-root user ----
+# Create /code/data and a default faces subdir so imports that mkdir won't fail
+RUN mkdir -p /code/data/faces /code/models \
+ && chown -R ${APP_USER}:${APP_GROUP} /code /home/${APP_USER}
+
 USER ${APP_USER}
 
 EXPOSE 8000
 
-# Start FastAPI (adjust the module:path if your ASGI app variable is named differently)
+# Basic liveness check (adjust path if your API differs)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
+  CMD python -c "import urllib.request as u,sys; \
+    sys.exit(0 if u.urlopen('http://127.0.0.1:8000/docs', timeout=3).status < 500 else 1)" || exit 1
+
+# Start FastAPI
 CMD uvicorn app.api.server:app --host ${UVICORN_HOST} --port ${UVICORN_PORT}
