@@ -1,21 +1,21 @@
 {
   "project_info": {
-    "project_number": "671374498311",
-    "project_id": "attendace-app-b44b6",
-    "storage_bucket": "attendace-app-b44b6.firebasestorage.app"
+    "project_number": "482309728891",
+    "project_id": "adas-system",
+    "storage_bucket": "adas-system.firebasestorage.app"
   },
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:671374498311:android:5eb0065a0d61a0ad6be8a2",
+        "mobilesdk_app_id": "1:482309728891:android:0a91a79cc8ce6a9b1ad0de",
         "android_client_info": {
-          "package_name": "com.attendance_system"
+          "package_name": "com.adas_system"
         }
       },
       "oauth_client": [],
       "api_key": [
         {
-          "current_key": "AIzaSyDL_XeZOcxo4obvO9sdQsqZkEs1UFFTR8g"
+          "current_key": "AIzaSyAgEkOy61ngrCT_LOLSeL1bF8LlAwh0cvs"
         }
       ],
       "services": {
