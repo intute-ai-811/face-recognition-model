@@ -39,7 +39,7 @@ MAX_FACES: int = 10
 
 # ── Alignment / Embedding ────────────────────────────────────────────────────
 ALIGNED_SIZE: int = 112             # MobileFaceNet expects 112×112
-EMB_DIM: Literal[128, 512] = 128    # MobileFaceNet ONNX is typically 128-D
+EMB_DIM: Literal[128, 512] = 512    # MobileFaceNet ONNX is typically 128-D
 
 # ── Recognition ──────────────────────────────────────────────────────────────
 SIMILARITY_THRESHOLD: float = 0.55  # cosine similarity cutoff

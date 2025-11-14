@@ -325,8 +325,24 @@ async def mark_attendance(
         # 2) RECOGNITION PATH (ERP only AFTER confirm)
         # ─────────────────────────────────────────────
         preds = PIPE.recognize_image(img)
-        if not preds:
+
+        # Normalize preds to a list and safely handle "no results"
+        if preds is None:
             return {"status": "no_face", "message": "No face detected."}
+
+        # If it’s a numpy array, convert to list
+        if isinstance(preds, np.ndarray):
+            if preds.size == 0:
+                return {"status": "no_face", "message": "No face detected."}
+            preds = list(preds)
+
+        # If it’s any iterable, use len()
+        if not isinstance(preds, (list, tuple)):
+            preds = [preds]
+
+        if len(preds) == 0:
+            return {"status": "no_face", "message": "No face detected."}
+
 
         best = preds[0]
         best_pid = best["prediction"]["person_id"]
