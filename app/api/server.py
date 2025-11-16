@@ -262,24 +262,32 @@ async def register(
 
 
 # ───────────── Mark Attendance (ERP ENABLED on confirm) ─────────────
+
 @app.post("/mark_attendance")
 async def mark_attendance(
     file: UploadFile = File(...),
-    confirm_user_id: str | None = Form(None),
 ):
     """
-    - If confirm_user_id is provided → send attendance to ERP.
-    - Else: run recognition and ask client to confirm before ERP post.
+    Single-shot attendance:
+
+    - Mobile app sends an image frame.
+    - Server runs face recognition.
+    - If confidence is high enough, it immediately sends the mapped user_id
+      to the ERP/Lambda URL to write into the attendance DB.
+    - Mobile app gets a simple confirmation JSON, no follow-up / confirm_user_id.
     """
     from app.clients.http import post_json
     from app import config
 
     try:
+        # ─────────────────────────────────────────────
+        # 0) Read & decode image
+        # ─────────────────────────────────────────────
         raw = file.file.read()
         if not raw:
             return JSONResponse(
                 status_code=400,
-                content={"error": "Empty image upload"},
+                content={"status": "error", "message": "Empty image upload"},
             )
 
         arr = np.frombuffer(raw, np.uint8)
@@ -287,99 +295,153 @@ async def mark_attendance(
         if img is None:
             return JSONResponse(
                 status_code=400,
-                content={"error": "Invalid image"},
+                content={"status": "error", "message": "Invalid image"},
             )
 
         # ─────────────────────────────────────────────
-        # 1) CONFIRMED USER → SEND TO ERP NOW
-        # ─────────────────────────────────────────────
-        if confirm_user_id:
-            user_id_int = int(confirm_user_id)
-
-            payload = {"user_id": user_id_int}
-            # If ERP ever needs explicit UTC date, you can add it here:
-            # from datetime import datetime, timezone
-            # payload["date"] = datetime.now(timezone.utc).date().isoformat()
-
-            status, resp = await post_json(config.ERP_ATTENDANCE_URL, payload)
-
-            log.info(
-                "erp_attendance_sent",
-                extra={
-                    "confirm_user_id": confirm_user_id,
-                    "payload": payload,
-                    "status": status,
-                    "resp": resp,
-                },
-            )
-
-            return {
-                "status": "marked",
-                "chosen_user_id": confirm_user_id,
-                "erp_status": status,
-                "erp_response": resp,
-                "message": "Attendance sent to ERP successfully.",
-            }
-
-        # ─────────────────────────────────────────────
-        # 2) RECOGNITION PATH (ERP only AFTER confirm)
+        # 1) Run recognition
         # ─────────────────────────────────────────────
         preds = PIPE.recognize_image(img)
 
-        # Normalize preds to a list and safely handle "no results"
         if preds is None:
             return {"status": "no_face", "message": "No face detected."}
 
-        # If it’s a numpy array, convert to list
         if isinstance(preds, np.ndarray):
             if preds.size == 0:
                 return {"status": "no_face", "message": "No face detected."}
             preds = list(preds)
 
-        # If it’s any iterable, use len()
         if not isinstance(preds, (list, tuple)):
             preds = [preds]
 
         if len(preds) == 0:
             return {"status": "no_face", "message": "No face detected."}
 
-
         best = preds[0]
-        best_pid = best["prediction"]["person_id"]
+        best_pid = str(best["prediction"]["person_id"])
         best_sim = float(best["prediction"]["similarity"])
         top_k = best.get("top_k", [])
 
-        auto_thr = 0.75
-        maybe_thr = 0.60
+        auto_thr = getattr(config, "ATTEND_AUTO_THRESHOLD", 0.75)
+        maybe_thr = getattr(config, "ATTEND_MAYBE_THRESHOLD", 0.60)
 
-        # Not confident → no match
+        # ─────────────────────────────────────────────
+        # 2) Check confidence
+        # ─────────────────────────────────────────────
         if best_pid == "unknown" or best_sim < maybe_thr:
+            # Not confident at all → do NOT mark
             return {
                 "status": "no_match",
                 "best": {"person_id": best_pid, "similarity": best_sim},
-                "message": "Face not confidently recognized.",
+                "message": "Face not confidently recognized. Attendance not marked.",
             }
 
-        # Confident enough → ask client to confirm before ERP
-        if best_sim >= auto_thr:
+        # For anything below auto threshold, you can either:
+        # - also auto-mark, OR
+        # - be strict and refuse.
+        #
+        # Here we'll be strict: only auto-mark if >= auto_thr.
+        if best_sim < auto_thr:
             return {
-                "status": "needs_confirmation",
+                "status": "low_confidence",
                 "best": {"person_id": best_pid, "similarity": best_sim},
-                "message": f"Recognized {best_pid} with similarity {best_sim:.3f}. "
-                           f"Send confirm_user_id to post attendance to ERP.",
+                "candidates": top_k[:3],
+                "message": "Face recognized with low confidence. Attendance not auto-marked.",
             }
 
-        # Medium zone → also needs confirmation
+        # ─────────────────────────────────────────────
+        # 3) Map recognized person_id → ERP user_id
+        # ─────────────────────────────────────────────
+        # Support two cases:
+        #  - best_pid is already a numeric user_id ("72")
+        #  - best_pid is a label ("rhythm") that must be mapped via ERP_USER_MAP
+        erp_user_id = None
+
+        if best_pid.isdigit():
+            erp_user_id = int(best_pid)
+        else:
+            erp_user_id = config.ERP_USER_MAP.get(best_pid)
+
+        if erp_user_id is None:
+            # Cannot map to ERP id → log & bail
+            log.warning(
+                "erp_user_map_missing",
+                extra={"best_pid": best_pid, "similarity": best_sim},
+            )
+            return {
+                "status": "mapping_error",
+                "best": {"person_id": best_pid, "similarity": best_sim},
+                "message": f"Recognized {best_pid} but no ERP user mapping found. Attendance not marked.",
+            }
+
+        payload = {"user_id": erp_user_id}
+
+        # ─────────────────────────────────────────────
+        # 4) Fire request to ERP/Lambda to upsert attendance
+        # ─────────────────────────────────────────────
+        # We still await the HTTP call (so we can log issues),
+        # but the mobile app just gets a simple success/fail message
+        # and never needs to call back with confirm_user_id.
+        try:
+            status, resp = await post_json(config.ERP_ATTENDANCE_URL, payload)
+
+            log.info(
+                "erp_attendance_sent",
+                extra={
+                    "person_id": best_pid,
+                    "erp_user_id": erp_user_id,
+                    "similarity": best_sim,
+                    "payload": payload,
+                    "status": status,
+                    "resp": resp,
+                },
+            )
+        except Exception as e:
+            log.exception(
+                "erp_attendance_http_failed",
+                extra={"error": str(e), "payload": payload},
+            )
+            # Tell app: face recognized, but ERP write failed
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "status": "error",
+                    "best": {"person_id": best_pid, "similarity": best_sim},
+                    "message": "Face recognized but failed to mark attendance in ERP.",
+                },
+            )
+
+        # Optional: you *can* look at status to decide what to tell app.
+        # If you truly don't care and just want "marked", you can always return "marked".
+        if status not in (200, 201):
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "status": "erp_error",
+                    "best": {"person_id": best_pid, "similarity": best_sim},
+                    "message": "Face recognized but ERP/Lambda returned an error.",
+                },
+            )
+
+        # ─────────────────────────────────────────────
+        # 5) Success response to mobile app
+        # ─────────────────────────────────────────────
+        # Simple confirmation: attendance was (attempted to be) marked.
         return {
-            "status": "needs_confirmation",
-            "best": {"person_id": best_pid, "similarity": best_sim},
-            "candidates": top_k[:3],
-            "message": "Please confirm the correct person_id.",
+            "status": "marked",
+            "user_id": erp_user_id,
+            "person_id": best_pid,
+            "similarity": best_sim,
+            "message": "Attendance marked successfully.",
         }
 
     except Exception as e:
         log.exception("mark_attendance_failed", extra={"error": str(e)})
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": str(e)},
+        )
+
 
 
 # ───────────── Debug Firebase Test ─────────────
