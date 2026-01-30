@@ -8,6 +8,8 @@ import io
 import uuid
 from typing import Optional, Tuple
 import threading
+import pickle
+from fastapi import Header, HTTPException
 
 from fastapi import FastAPI, UploadFile, File, Query, Form
 from fastapi.responses import JSONResponse
@@ -17,6 +19,134 @@ from starlette.concurrency import run_in_threadpool
 
 from app.logging_config import setup_logging
 from app.core.recognize import Pipeline
+
+# ✅ Add this near your Firebase globals (top-level in server.py)
+admin_lock = threading.Lock()
+
+def _require_admin(x_admin_token: Optional[str]) -> None:
+    expected = os.getenv("ADMIN_TOKEN")  # set this in docker env
+    if not expected:
+        # safer default: if you forgot to set ADMIN_TOKEN, don't expose admin endpoints
+        raise HTTPException(status_code=503, detail="Admin endpoints disabled (ADMIN_TOKEN not set).")
+    if not x_admin_token or x_admin_token != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _people_dump() -> dict:
+    """
+    Best-effort: prefer PIPE.db.people() if available, else read people.pkl directly.
+    """
+    # Prefer your DB API if present
+    try:
+        if hasattr(PIPE, "db") and hasattr(PIPE.db, "people"):
+            data = PIPE.db.people()
+            # Ensure JSON-safe
+            return dict(data) if isinstance(data, dict) else {"people": data}
+    except Exception:
+        pass
+
+    # Fallback: read people.pkl
+    from app import config
+    if not config.PEOPLE_FILE.exists():
+        return {}
+    with open(config.PEOPLE_FILE, "rb") as f:
+        obj = pickle.load(f)
+    return dict(obj) if isinstance(obj, dict) else {"people": obj}
+
+
+def _remove_person_from_pickles(person_id: str) -> dict:
+    """
+    Fallback deletion logic if PIPE.db does not provide deletion APIs.
+    Removes:
+      - person_id from people.pkl
+      - all embeddings with label==person_id from index.pkl
+    Returns counts.
+    """
+    from app import config
+
+    removed_people = 0
+    removed_embeddings = 0
+
+    # --- people.pkl ---
+    if config.PEOPLE_FILE.exists():
+        with open(config.PEOPLE_FILE, "rb") as f:
+            people = pickle.load(f)
+        if isinstance(people, dict) and person_id in people:
+            del people[person_id]
+            removed_people = 1
+            with open(config.PEOPLE_FILE, "wb") as f:
+                pickle.dump(people, f)
+
+    # --- index.pkl ---
+    if config.EMBED_INDEX_FILE.exists():
+        with open(config.EMBED_INDEX_FILE, "rb") as f:
+            idx = pickle.load(f)
+
+        # Common representation: {"embeddings": np.ndarray, "labels": list[str]}
+        if isinstance(idx, dict) and "labels" in idx and "embeddings" in idx:
+            labels = list(idx["labels"])
+            embs = idx["embeddings"]
+
+            keep_mask = [str(l) != str(person_id) for l in labels]
+            removed_embeddings = int(len(labels) - sum(keep_mask))
+
+            if removed_embeddings > 0:
+                idx["labels"] = [l for l, k in zip(labels, keep_mask) if k]
+                # embeddings: np.ndarray shape [N, D]
+                idx["embeddings"] = embs[np.array(keep_mask, dtype=bool)]
+
+                with open(config.EMBED_INDEX_FILE, "wb") as f:
+                    pickle.dump(idx, f)
+
+        # If your index.pkl is a custom class, we can’t safely mutate it here.
+        # In that case, you should implement PIPE.db.remove_person(person_id) and persist.
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Unknown index.pkl format. Implement deletion in storage layer (PIPE.db.remove_person)."
+            )
+
+    return {
+        "removed_people_entry": removed_people,
+        "removed_embeddings": removed_embeddings,
+    }
+
+
+def _try_remove_person(person_id: str) -> dict:
+    """
+    Preferred: call storage/db API if you have it.
+    Fallback: delete directly from pickle files.
+    """
+    # 1) Try DB API(s) if your Storage layer has them
+    if hasattr(PIPE, "db"):
+        db = PIPE.db
+        # best guesses for method names; use what exists
+        for meth in ("remove_person", "delete_person", "drop_person"):
+            if hasattr(db, meth):
+                fn = getattr(db, meth)
+                out = fn(person_id)
+                # if it returns nothing, still ok
+                return {"removed_via": f"PIPE.db.{meth}", "result": out}
+
+        # If you have low-level accessors, you can still remove name entry
+        # (embeddings removal still needs a db method)
+        if hasattr(db, "set_person"):
+            # optional: remove name mapping only (won't remove embeddings)
+            pass
+
+    # 2) Fallback: edit pickles directly
+    out = _remove_person_from_pickles(str(person_id).strip())
+
+    # Optional: if your DB/cache is in memory, you may need to reload
+    if hasattr(PIPE, "db") and hasattr(PIPE.db, "reload"):
+        try:
+            PIPE.db.reload()
+            out["db_reload"] = True
+        except Exception:
+            out["db_reload"] = False
+
+    return {"removed_via": "pickle_fallback", **out}
+
 
 # ─────────────── Setup ────────────────
 setup_logging()
@@ -627,6 +757,46 @@ async def logout(request: Request, file: UploadFile = File(...)):
         log.exception("logout_failed", extra={"request_id": rid})
         return JSONResponse(status_code=500, content={"status": "error", "request_id": rid, "message": "Internal server error"})
 
+
+# ✅ Add these endpoints anywhere below your existing routes (server.py)
+
+@app.get("/admin/people")
+def admin_people(
+    request: Request,
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    rid = _request_id(request)
+    _require_admin(x_admin_token)
+
+    with admin_lock:
+        people = _people_dump()
+
+    return {
+        "ok": True,
+        "request_id": rid,
+        "count": len(people) if isinstance(people, dict) else None,
+        "people": people,
+    }
+
+
+@app.delete("/admin/person/{person_id}")
+def admin_delete_person(
+    person_id: str,
+    request: Request,
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    rid = _request_id(request)
+    _require_admin(x_admin_token)
+
+    pid = str(person_id).strip()
+    if not pid:
+        raise HTTPException(status_code=400, detail="person_id required")
+
+    with admin_lock:
+        result = _try_remove_person(pid)
+
+    log.warning("admin_person_deleted", extra={"request_id": rid, "person_id": pid, "result": result})
+    return {"ok": True, "request_id": rid, "person_id": pid, "result": result}
 
 # ───────────── Root ─────────────
 @app.get("/")
