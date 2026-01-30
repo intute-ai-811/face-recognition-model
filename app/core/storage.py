@@ -1,12 +1,9 @@
 # app/core/storage.py
-import logging
 import pickle
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
-import cv2
 
 from app import config
 from app.logging_config import get_logger, timed
@@ -14,9 +11,6 @@ from app.logging_config import get_logger, timed
 log = get_logger(__name__)
 
 
-# ────────────────────────────────────────────────────────────────
-# Dataclass for a single embedding record
-# ────────────────────────────────────────────────────────────────
 @dataclass
 class EmbRecord:
     person_id: str
@@ -25,36 +19,82 @@ class EmbRecord:
     source: str
 
 
-# ────────────────────────────────────────────────────────────────
-# Local embedding storage manager
-# ────────────────────────────────────────────────────────────────
 class LocalStore:
     """
-    Handles local storage of embeddings and aligned face crops.
-    Embeddings are stored as pickle (index.pkl), crops as JPEGs.
-
-    This version enforces a single embedding dimension (config.EMB_DIM)
-    across all stored embeddings and all queries, to avoid dimension
-    mismatch errors (e.g. 128 vs 512) during cosine search.
+    Handles local storage of embeddings (index.pkl) and person metadata (people.pkl).
+    Embeddings are stored as pickle (index.pkl). Person metadata (e.g. name) is
+    stored separately in people.pkl so you can return person_name without ERP mapping.
     """
 
     def __init__(self):
         if not hasattr(config, "EMB_DIM"):
-            raise ValueError(
-                "config.EMB_DIM is not set. Please define it to match your "
-                "embedder output dimension."
-            )
+            raise ValueError("config.EMB_DIM is not set. Please define it to match embedder output.")
 
         self.emb_dim: int = int(config.EMB_DIM)
 
         config.EMBED_DIR.mkdir(parents=True, exist_ok=True)
         self.index_file = config.EMBED_INDEX_FILE
+
+        # Person metadata file (id -> {"name": "...", "updated_at": ...})
+        self.people_file: Path = getattr(config, "PEOPLE_FILE", config.DATA_DIR / "people.pkl")
+        self._people: dict[str, dict] = {}
+        self._load_people()
+
         self._records: list[EmbRecord] = []
         self._matrix: np.ndarray | None = None
         self._person: list[str] = []
         self._load()
 
-    # ─────────────────────────────────────────────────────────────
+    # ───────────────────────────────
+    # People metadata (id -> name)
+    # ───────────────────────────────
+    def _load_people(self):
+        if self.people_file.exists():
+            try:
+                with open(self.people_file, "rb") as f:
+                    data = pickle.load(f)
+                if isinstance(data, dict):
+                    self._people = data
+                else:
+                    self._people = {}
+                log.info("people_loaded", extra={"count": len(self._people), "file": str(self.people_file)})
+            except Exception as e:
+                log.warning("people_load_failed", extra={"file": str(self.people_file), "error": str(e)})
+                self._people = {}
+        else:
+            self._people = {}
+            log.info("people_file_missing", extra={"file": str(self.people_file)})
+
+    def _persist_people(self):
+        self.people_file.parent.mkdir(parents=True, exist_ok=True)
+        with timed(log, "persist_people", count=len(self._people), file=str(self.people_file)):
+            with open(self.people_file, "wb") as f:
+                pickle.dump(self._people, f)
+        log.info("people_persist_done", extra={"count": len(self._people)})
+
+    def set_person(self, person_id: str, name: str | None):
+        pid = str(person_id).strip()
+        if not pid:
+            return
+        nm = (name or "").strip()
+        if not nm:
+            return  # don't overwrite with empty
+
+        self._people[pid] = {"name": nm, "updated_at": time.time()}
+        self._persist_people()
+
+    def get_person_name(self, person_id: str) -> str | None:
+        pid = str(person_id).strip()
+        if not pid:
+            return None
+        rec = self._people.get(pid)
+        if not rec:
+            return None
+        return rec.get("name") or None
+
+    # ───────────────────────────────
+    # Embeddings index
+    # ───────────────────────────────
     def _load(self):
         """Load existing embeddings from disk into memory and validate dimensions."""
         if self.index_file.exists():
@@ -66,7 +106,6 @@ class LocalStore:
 
             for r in data:
                 emb = np.asarray(r["embedding"], np.float32)
-                # We expect a flat vector of length emb_dim
                 if emb.ndim != 1:
                     bad_dims.add(tuple(emb.shape))
                 elif emb.shape[0] != self.emb_dim:
@@ -82,171 +121,93 @@ class LocalStore:
                     )
 
             if bad_dims:
-                # Fail fast with a clear error instead of matmul mismatch later
                 raise ValueError(
                     f"Loaded embeddings from {self.index_file} with dimensions {bad_dims}, "
-                    f"but expected emb_dim={self.emb_dim}. "
-                    f"This usually happens after changing the embedder model "
-                    f"without recreating the index. "
-                    f"Delete the old index file ({self.index_file}) and re-enroll users."
+                    f"but expected emb_dim={self.emb_dim}. Delete {self.index_file} and re-enroll."
                 )
 
             log.info(
                 "embeddings_loaded",
-                extra={
-                    "count": len(self._records),
-                    "file": str(self.index_file),
-                    "emb_dim": self.emb_dim,
-                },
+                extra={"count": len(self._records), "file": str(self.index_file), "emb_dim": self.emb_dim},
             )
         else:
             log.info("no_existing_index", extra={"file": str(self.index_file)})
 
         self._rebuild_cache()
 
-    # ─────────────────────────────────────────────────────────────
     def _rebuild_cache(self):
         """Rebuild in-memory matrix and person list for cosine search."""
         if self._records:
-            # Extra safety: validate dimensions before stacking
             for r in self._records:
                 if r.embedding.ndim != 1 or r.embedding.shape[0] != self.emb_dim:
                     raise ValueError(
-                        f"Record for person_id={r.person_id} has embedding shape "
-                        f"{r.embedding.shape}, expected ({self.emb_dim},). "
-                        f"The index file is inconsistent. Delete {self.index_file} "
-                        f"and re-enroll."
+                        f"Record for person_id={r.person_id} has embedding shape {r.embedding.shape}, "
+                        f"expected ({self.emb_dim},). Delete {self.index_file} and re-enroll."
                     )
 
             self._matrix = np.vstack([r.embedding for r in self._records])
             self._person = [r.person_id for r in self._records]
         else:
-            # When empty, keep a consistent zero-sized matrix with emb_dim columns
             self._matrix = np.zeros((0, self.emb_dim), np.float32)
             self._person = []
 
         log.info(
             "cache_rebuilt",
-            extra={
-                "records": len(self._records),
-                "unique_people": len(set(self._person)),
-                "emb_dim": self.emb_dim,
-            },
+            extra={"records": len(self._records), "unique_people": len(set(self._person)), "emb_dim": self.emb_dim},
         )
 
-    # ─────────────────────────────────────────────────────────────
     def persist(self):
-        """Persist all records to pickle."""
-        with timed(
-            log,
-            "persist_index",
-            count=len(self._records),
-            file=str(self.index_file),
-        ):
+        """Persist all embedding records to pickle."""
+        with timed(log, "persist_index", count=len(self._records), file=str(self.index_file)):
             serializable = [
-                {
-                    "person_id": r.person_id,
-                    "embedding": r.embedding.astype(np.float32),
-                    "ts": r.ts,
-                    "source": r.source,
-                }
+                {"person_id": r.person_id, "embedding": r.embedding.astype(np.float32), "ts": r.ts, "source": r.source}
                 for r in self._records
             ]
             with open(self.index_file, "wb") as f:
                 pickle.dump(serializable, f)
         log.info("persist_done", extra={"count": len(self._records)})
 
-    # ─────────────────────────────────────────────────────────────
-    def save_aligned(self, person_id: str, aligned_bgr: np.ndarray) -> Path:
-        """
-        Previously saved aligned face crops to disk.
-        Now a no-op because faces are stored in Firebase via /register.
-        """
-        log.info("save_crop_skipped", extra={"person_id": person_id})
-        # Return a dummy path so existing callers don't break
-        return config.DATA_DIR / "faces" / f"{person_id}_ignored.jpg"
-
-    # ─────────────────────────────────────────────────────────────
     def add_embeddings(self, person_id: str, embs: np.ndarray, source: str) -> int:
-        """Add new embeddings and update cache."""
         if embs is None or embs.size == 0:
             log.warning("add_embs_empty", extra={"person_id": person_id})
             return 0
 
         if embs.ndim == 1:
-            # Allow single embedding vector
             embs = embs.reshape(1, -1)
 
         if embs.ndim != 2:
-            raise ValueError(
-                f"add_embeddings expected 2D array, got shape {embs.shape} "
-                f"for person_id={person_id}"
-            )
+            raise ValueError(f"add_embeddings expected 2D array, got shape {embs.shape} for person_id={person_id}")
 
         if embs.shape[1] != self.emb_dim:
             raise ValueError(
-                f"add_embeddings received dim={embs.shape[1]} but store emb_dim={self.emb_dim} "
-                f"for person_id={person_id}. "
-                f"Check that config.EMB_DIM ({self.emb_dim}) matches your embedder model "
-                f"output dimension."
+                f"add_embeddings received dim={embs.shape[1]} but store emb_dim={self.emb_dim} for person_id={person_id}"
             )
 
         now = time.time()
         for e in embs:
             self._records.append(EmbRecord(person_id, e, now, source))
 
-        log.info(
-            "add_embs",
-            extra={
-                "person_id": person_id,
-                "count": int(embs.shape[0]),
-                "emb_dim": self.emb_dim,
-            },
-        )
+        log.info("add_embs", extra={"person_id": person_id, "count": int(embs.shape[0]), "emb_dim": self.emb_dim})
         self.persist()
         self._rebuild_cache()
-        return embs.shape[0]
+        return int(embs.shape[0])
 
-    # ─────────────────────────────────────────────────────────────
     def search_cosine(self, q: np.ndarray, top_k: int):
-        """
-        Return, for each query embedding, a ranked list of unique persons:
-        [{person_id, score}, ...]
-        """
         if self._matrix is None or len(self._records) == 0:
             log.info("search_empty")
             return []
 
-        # Ensure q is 2D (n_queries, emb_dim)
         if q.ndim == 1:
             q = q.reshape(1, -1)
 
         if q.ndim != 2:
-            raise ValueError(
-                f"search_cosine expected 2D query array, got shape {q.shape}"
-            )
+            raise ValueError(f"search_cosine expected 2D query array, got shape {q.shape}")
 
         if q.shape[1] != self.emb_dim:
-            raise ValueError(
-                f"search_cosine query dim={q.shape[1]} but store emb_dim={self.emb_dim}. "
-                f"This usually means the embedder model changed without updating "
-                f"config.EMB_DIM or recreating the index."
-            )
+            raise ValueError(f"search_cosine query dim={q.shape[1]} but store emb_dim={self.emb_dim}.")
 
-        if self._matrix.shape[1] != self.emb_dim:
-            raise ValueError(
-                f"search_cosine index matrix dim={self._matrix.shape[1]} "
-                f"but store emb_dim={self.emb_dim}. The index file may be corrupted "
-                f"or from an older model; delete {self.index_file} and re-enroll."
-            )
-
-        with timed(
-            log,
-            "search_cosine",
-            queries=int(q.shape[0]),
-            db_size=len(self._records),
-        ):
-            sims = q @ self._matrix.T  # cosine sim since embeddings are L2-normalized
+        with timed(log, "search_cosine", queries=int(q.shape[0]), db_size=len(self._records)):
+            sims = q @ self._matrix.T
 
         results = []
         for i in range(q.shape[0]):
@@ -255,44 +216,38 @@ class LocalStore:
                 s = float(sims[i, j])
                 if (pid not in agg) or (s > agg[pid]):
                     agg[pid] = s
-            ranked = sorted(
-                ({"person_id": pid, "score": sc} for pid, sc in agg.items()),
-                key=lambda x: -x["score"],
-            )[:top_k]
+            ranked = sorted(({"person_id": pid, "score": sc} for pid, sc in agg.items()), key=lambda x: -x["score"])[:top_k]
             results.append(ranked)
 
-        log.info(
-            "search_done",
-            extra={
-                "queries": int(q.shape[0]),
-                "unique_people": len(set(self._person)),
-                "top_k": top_k,
-                "emb_dim": self.emb_dim,
-            },
-        )
+        log.info("search_done", extra={"queries": int(q.shape[0]), "unique_people": len(set(self._person)), "top_k": top_k})
         return results
 
-    # ─────────────────────────────────────────────────────────────
     def people(self) -> dict[str, int]:
-        """Return dict of person_id → embedding count."""
         counts = {}
         for r in self._records:
             counts[r.person_id] = counts.get(r.person_id, 0) + 1
         log.info("people_summary", extra={"unique_people": len(counts)})
         return counts
 
-    # ─────────────────────────────────────────────────────────────
     def delete_person(self, person_id: str) -> int:
-        """Delete all embeddings and crops for a person."""
+        """Delete all embeddings and metadata for a person."""
+        pid = str(person_id).strip()
+        if not pid:
+            return 0
+
         before = len(self._records)
-        self._records = [r for r in self._records if r.person_id != person_id]
-        pid_dir = config.FACES_DIR / person_id
-        if pid_dir.exists():
-            for p in pid_dir.glob("*.jpg"):
-                p.unlink(missing_ok=True)
-            pid_dir.rmdir()
+
+        # Remove embeddings
+        self._records = [r for r in self._records if r.person_id != pid]
+
+        # Remove person metadata (name)
+        if pid in self._people:
+            del self._people[pid]
+            self._persist_people()
+
         self.persist()
         self._rebuild_cache()
+
         removed = before - len(self._records)
-        log.info("delete_person", extra={"person_id": person_id, "removed": removed})
-        return removed
+        log.info("delete_person", extra={"person_id": pid, "removed_embeddings": removed})
+        return int(removed)

@@ -14,6 +14,7 @@ DATA_DIR: Path = BASE_DIR.parent / "data"
 FACES_DIR: Path = DATA_DIR / "faces"
 EMBED_DIR: Path = DATA_DIR / "embeddings"
 EMBED_INDEX_FILE: Path = EMBED_DIR / "index.pkl"
+PEOPLE_FILE: Path = DATA_DIR / "people.pkl"
 
 # Ensure data directories exist (harmless if already present)
 EMBED_DIR.mkdir(parents=True, exist_ok=True)
