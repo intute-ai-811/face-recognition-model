@@ -209,6 +209,31 @@ def init_firebase_once():
         logging.getLogger(__name__).info("Firebase initialized", extra={"bucket": bucket_name})
 
 
+UPLOAD_TO_FIREBASE = os.getenv("UPLOAD_TO_FIREBASE", "0") == "1"
+
+def _encode_debug_jpg(img: np.ndarray, max_w: int = 640, quality: int = 80) -> bytes:
+    """Downscale + compress image for quick debug uploads."""
+    h, w = img.shape[:2]
+    if w > max_w:
+        new_h = int(h * (max_w / w))
+        img = cv2.resize(img, (max_w, new_h))
+    ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    return enc.tobytes() if ok else b""
+
+def _bg_firebase_upload(rid: str, folder: str, filename: str, data: bytes, content_type: str):
+    """Fire-and-forget upload so /register doesn't wait."""
+    try:
+        gs_url, public_url = firebase_upload_bytes(folder, filename, data, content_type)
+        logging.getLogger(__name__).info(
+            "firebase_upload_ok",
+            extra={"request_id": rid, "file": filename, "gs_url": gs_url, "public_url": public_url},
+        )
+    except Exception as e:
+        logging.getLogger(__name__).exception(
+            "firebase_upload_failed",
+            extra={"request_id": rid, "file": filename, "error": str(e)},
+        )
+
 def firebase_upload_bytes(
     folder_path: str,
     filename: str,
@@ -351,17 +376,18 @@ async def register(
     except Exception as e:
         log.warning("set_person_name_failed", extra={"request_id": rid, "person_id": person_id, "error": str(e)})
 
-    # Best-effort Firebase init
-    try:
-        init_firebase_once()
-    except Exception as e:
-        logging.getLogger(__name__).warning("Firebase init on /register failed", extra={"request_id": rid, "error": str(e)})
+    # Best-effort Firebase init (only matters if UPLOAD_TO_FIREBASE=1)
+    if UPLOAD_TO_FIREBASE:
+        try:
+            init_firebase_once()
+        except Exception as e:
+            logging.getLogger(__name__).warning("Firebase init on /register failed", extra={"request_id": rid, "error": str(e)})
 
     cap = min(max_images, getattr(config, "MAX_IMAGES", max_images))
     max_bytes = getattr(config, "MAX_UPLOAD_BYTES", 5 * 1024 * 1024)
 
     total_faces = total_emb = processed = errors = 0
-    uploaded = []
+    uploaded = []  # will store only debug uploads (bad frames)
 
     log.info(
         "api_register_in",
@@ -386,22 +412,6 @@ async def register(
                 continue
 
             safe_name = os.path.basename(getattr(f, "filename", f"frame_{i:04d}.jpg")) or f"frame_{i:04d}.jpg"
-            folder = f"users/{person_id}/raw"
-
-            # Upload to Firebase (if initialized). Offload blocking upload.
-            if firebase_initialized:
-                try:
-                    gs_url, public_url = await run_in_threadpool(
-                        firebase_upload_bytes,
-                        folder,
-                        safe_name,
-                        raw,
-                        getattr(f, "content_type", "image/jpeg"),
-                    )
-                    uploaded.append({"file": safe_name, "gs_url": gs_url, "public_url": public_url})
-                except Exception as up_e:
-                    errors += 1
-                    log.exception("firebase_upload_failed", extra={"request_id": rid, "idx": i, "file": safe_name, "error": str(up_e)})
 
             # Decode (offload)
             arr = np.frombuffer(raw, np.uint8)
@@ -413,9 +423,26 @@ async def register(
 
             # Enroll (offload)
             res = await run_in_threadpool(PIPE.enroll_image, img, person_id=person_id, source=safe_name)
-            total_faces += int(res.get("faces", 0))
-            total_emb += int(res.get("embeddings_added", 0))
+            faces = int(res.get("faces", 0))
+            embs = int(res.get("embeddings_added", 0))
+
+            total_faces += faces
+            total_emb += embs
             processed += 1
+
+            # ✅ Upload ONLY bad frames for debugging (and do it async)
+            if UPLOAD_TO_FIREBASE and firebase_initialized:
+                if faces == 0 or embs == 0:
+                    debug_bytes = _encode_debug_jpg(img, max_w=640, quality=80)
+                    if debug_bytes:
+                        debug_name = f"bad_{i:04d}_{safe_name}"
+                        debug_folder = f"users/{person_id}/debug_failed"
+                        threading.Thread(
+                            target=_bg_firebase_upload,
+                            args=(rid, debug_folder, debug_name, debug_bytes, "image/jpeg"),
+                            daemon=True,
+                        ).start()
+                        uploaded.append({"file": debug_name, "folder": debug_folder})
 
         except Exception as e:
             errors += 1
@@ -433,12 +460,11 @@ async def register(
         "errors": errors,
         "faces_detected": total_faces,
         "embeddings_added": total_emb,
-        "uploaded": uploaded,
+        "uploaded_debug": uploaded,  # only bad frames
     }
 
     log.info("api_register_out", extra=summary)
 
-    # IMPORTANT: if nothing got enrolled, return non-200
     if not ok:
         return JSONResponse(
             status_code=400,
