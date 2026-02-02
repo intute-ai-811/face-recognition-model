@@ -803,6 +803,25 @@ def admin_delete_person(
     log.warning("admin_person_deleted", extra={"request_id": rid, "person_id": pid, "result": result})
     return {"ok": True, "request_id": rid, "person_id": pid, "result": result}
 
+@app.post("/debug/firebase_test")
+async def firebase_test(request: Request, user_id: str = Form(...)):
+    rid = _request_id(request)
+    try:
+        init_firebase_once()
+        payload = f"hello from server at {int(time.time())}\n".encode()
+        gs_url, public_url = await run_in_threadpool(
+            firebase_upload_bytes,
+            f"users/{str(user_id).strip()}/debug",
+            "ping.txt",
+            payload,
+            "text/plain",
+        )
+        return {"ok": True, "request_id": rid, "gs_url": gs_url, "public_url": public_url, "bucket": firebase_bucket.name}
+    except Exception:
+        log.exception("firebase_test_failed", extra={"request_id": rid})
+        return JSONResponse(status_code=500, content={"ok": False, "request_id": rid, "error": "firebase_test_failed"})
+
+
 # ───────────── Root ─────────────
 @app.get("/")
 def root(request: Request):
