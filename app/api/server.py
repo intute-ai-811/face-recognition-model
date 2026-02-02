@@ -430,19 +430,27 @@ async def register(
             total_emb += embs
             processed += 1
 
-            # ✅ Upload ONLY bad frames for debugging (and do it async)
+            
+            # ✅ Upload: first 5 frames ALWAYS + any bad frames (no face OR no/poor embeddings)
             if UPLOAD_TO_FIREBASE and firebase_initialized:
-                if faces == 0 or embs == 0:
+                should_upload = (i <= 5) or (faces == 0) or (embs == 0)
+
+                if should_upload:
                     debug_bytes = _encode_debug_jpg(img, max_w=640, quality=80)
                     if debug_bytes:
-                        debug_name = f"bad_{i:04d}_{safe_name}"
+                        # Name it clearly so you know WHY it was uploaded
+                        reason = "first5" if i <= 5 else ("noface" if faces == 0 else "noemb")
+                        debug_name = f"{reason}_{i:04d}_{safe_name}"
                         debug_folder = f"users/{person_id}/debug_failed"
+
                         threading.Thread(
                             target=_bg_firebase_upload,
                             args=(rid, debug_folder, debug_name, debug_bytes, "image/jpeg"),
                             daemon=True,
                         ).start()
-                        uploaded.append({"file": debug_name, "folder": debug_folder})
+
+                        uploaded.append({"file": debug_name, "folder": debug_folder, "reason": reason})
+
 
         except Exception as e:
             errors += 1
