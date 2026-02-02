@@ -39,4 +39,3 @@ DIVERSITY_COSINE_TOL: float = 0.05
 
 # ── ERP Integration ─────────────────────────────────────────────────────────
 ERP_ATTENDANCE_URL: str = os.getenv("ERP_ATTENDANCE_URL", "https://j7lo9j074j.execute-api.ap-south-1.amazonaws.com/attendanceConfirmation")
-# Note: ERP_USER_MAP removed. Use the person_id directly as the ERP ID.

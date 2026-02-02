@@ -583,6 +583,14 @@ async def mark_attendance(request: Request, file: UploadFile = File(...)):
                 },
             )
 
+        # ✅ NEW: show already-checked-in time if ERP says so
+        msg = "Attendance marked successfully."
+        if isinstance(resp, dict):
+            erp_status = resp.get("status")
+            if erp_status == "already_checked_in":
+                in_time = resp.get("attendance", {}).get("check_in_time_ist_text")
+                msg = f"Already checked in at {in_time}" if in_time else "Already checked in."
+
         return {
             "status": "marked",
             "request_id": rid,
@@ -590,32 +598,12 @@ async def mark_attendance(request: Request, file: UploadFile = File(...)):
             "person_id": best_pid,
             "person_name": person_name,
             "similarity": best_sim,
-            "message": "Attendance marked successfully.",
+            "message": msg,
         }
 
     except Exception:
         log.exception("mark_attendance_failed", extra={"request_id": rid})
         return JSONResponse(status_code=500, content={"status": "error", "request_id": rid, "message": "Internal server error"})
-
-
-# ───────────── Debug Firebase Test ─────────────
-@app.post("/debug/firebase_test")
-async def firebase_test(request: Request, user_id: str = Form(...)):
-    rid = _request_id(request)
-    try:
-        init_firebase_once()
-        payload = f"hello from server at {int(time.time())}\n".encode()
-        gs_url, public_url = await run_in_threadpool(
-            firebase_upload_bytes,
-            f"users/{str(user_id).strip()}/debug",
-            "ping.txt",
-            payload,
-            "text/plain",
-        )
-        return {"ok": True, "request_id": rid, "gs_url": gs_url, "public_url": public_url, "bucket": firebase_bucket.name}
-    except Exception:
-        log.exception("firebase_test_failed", extra={"request_id": rid})
-        return JSONResponse(status_code=500, content={"ok": False, "request_id": rid, "error": "firebase_test_failed"})
 
 
 # ───────────── Logout ─────────────
@@ -736,15 +724,10 @@ async def logout(request: Request, file: UploadFile = File(...)):
                 content={
                     "status": "error",
                     "request_id": rid,
-                    "best": {
-                        "person_id": best_pid,
-                        "person_name": person_name,
-                        "similarity": best_sim,
-                    },
+                    "best": {"person_id": best_pid, "person_name": person_name, "similarity": best_sim},
                     "message": "Face recognized but failed to mark logout in ERP.",
                 },
             )
-
 
         if status not in (200, 201):
             return JSONResponse(
@@ -757,6 +740,14 @@ async def logout(request: Request, file: UploadFile = File(...)):
                 },
             )
 
+        # ✅ NEW: show already-checked-out time if ERP says so
+        msg = "Logout marked successfully."
+        if isinstance(resp, dict):
+            erp_status = resp.get("status")
+            if erp_status == "already_checked_out":
+                out_time = resp.get("attendance", {}).get("check_out_time_ist_text")
+                msg = f"Already logged out at {out_time}" if out_time else "Already logged out."
+
         return {
             "status": "logged_out",
             "request_id": rid,
@@ -764,7 +755,7 @@ async def logout(request: Request, file: UploadFile = File(...)):
             "person_id": best_pid,
             "person_name": person_name,
             "similarity": best_sim,
-            "message": "Logout marked successfully.",
+            "message": msg,
         }
 
     except Exception:
