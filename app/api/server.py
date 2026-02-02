@@ -714,7 +714,7 @@ async def logout(request: Request, file: UploadFile = File(...)):
         payload = {"user_id": erp_user_id, "type": "OUT"}
 
         try:
-            status, resp = await post_json(config.ERP_LOGOUT_URL, payload)
+            status, resp = await post_json(config.ERP_ATTENDANCE_URL, payload)
             log.info(
                 "erp_logout_sent",
                 extra={"request_id": rid, "person_id": best_pid, "erp_user_id": erp_user_id, "similarity": best_sim, "status": status},
@@ -725,7 +725,7 @@ async def logout(request: Request, file: UploadFile = File(...)):
                 "erp_logout_http_failed",
                 extra={
                     "request_id": rid,
-                    "erp_url": config.ERP_LOGOUT_URL,
+                    "erp_url": config.ERP_ATTENDANCE_URL,
                     "payload": payload,
                     "exception_type": type(e).__name__,
                     "exception_msg": str(e),
