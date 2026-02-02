@@ -721,16 +721,30 @@ async def logout(request: Request, file: UploadFile = File(...)):
             )
             log.debug("erp_logout_resp_debug", extra={"request_id": rid, "payload": payload, "resp": resp})
         except Exception as e:
-            log.exception("erp_logout_http_failed", extra={"request_id": rid, "error": str(e)})
+            log.exception(
+                "erp_logout_http_failed",
+                extra={
+                    "request_id": rid,
+                    "erp_url": config.ERP_LOGOUT_URL,
+                    "payload": payload,
+                    "exception_type": type(e).__name__,
+                    "exception_msg": str(e),
+                },
+            )
             return JSONResponse(
                 status_code=502,
                 content={
                     "status": "error",
                     "request_id": rid,
-                    "best": {"person_id": best_pid, "person_name": person_name, "similarity": best_sim},
+                    "best": {
+                        "person_id": best_pid,
+                        "person_name": person_name,
+                        "similarity": best_sim,
+                    },
                     "message": "Face recognized but failed to mark logout in ERP.",
                 },
             )
+
 
         if status not in (200, 201):
             return JSONResponse(
