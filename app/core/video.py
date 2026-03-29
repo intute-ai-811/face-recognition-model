@@ -1,3 +1,4 @@
+#app/core/video.py
 from __future__ import annotations
 import cv2
 import tempfile
@@ -9,9 +10,14 @@ from app import config
 
 log = get_logger(__name__)
 
-def iter_video_frames_from_bytes(video_bytes: bytes, sample_every: int = 2, max_frames: int = 180) -> List[np.ndarray]:
+
+def iter_video_frames_from_bytes(
+    video_bytes: bytes,
+    sample_every: int = 2,
+    max_frames: int = 180,
+) -> List[np.ndarray]:
     log.info("video_read", extra={"bytes": len(video_bytes)})
-    # write bytes to a temporary file for OpenCV VideoCapture
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
         f.write(video_bytes)
         tmp_path = f.name
@@ -22,7 +28,6 @@ def iter_video_frames_from_bytes(video_bytes: bytes, sample_every: int = 2, max_
             os.remove(tmp_path)
         except Exception:
             pass
-        # Fail cleanly so API returns JSON instead of 500
         raise ValueError("Could not open video (unsupported codec or corrupt file)")
 
     frames, idx, kept = [], 0, 0
@@ -35,6 +40,7 @@ def iter_video_frames_from_bytes(video_bytes: bytes, sample_every: int = 2, max_
                 frames.append(frame)
                 kept += 1
             idx += 1
+
     cap.release()
     try:
         os.remove(tmp_path)
@@ -44,49 +50,45 @@ def iter_video_frames_from_bytes(video_bytes: bytes, sample_every: int = 2, max_
     log.info("video_frames", extra={"decoded": idx, "kept": len(frames), "sample_every": sample_every})
     return frames
 
-import numpy as np
-
-import numpy as np
-from app.logging_config import get_logger
-log = get_logger(__name__)
 
 def pick_diverse_indices(
     embeddings: np.ndarray,
     max_keep: int = 20,
     dedupe_cosine: float = config.DIVERSITY_COSINE_TOL,
-):
+) -> list[int]:
     """
-    Select up to `max_keep` diverse embeddings by cosine distance.
+    Select up to max_keep diverse embeddings by cosine distance.
 
     Args:
-        embeddings (np.ndarray): (N, D) L2-normalized embeddings
-        max_keep (int): number of diverse samples to keep
-        dedupe_cosine (float): threshold; embeddings with cosine sim > 1 - dedupe_cosine are considered too similar
+        embeddings:    (N, D) L2-normalized embeddings
+        max_keep:      max number of diverse samples to keep
+        dedupe_cosine: if the closest unused embedding has cosine distance
+                       less than this, stop early (too similar to add value)
 
     Returns:
-        list[int]: indices of selected embeddings
+        list of selected indices into embeddings
     """
     n = embeddings.shape[0]
     if n <= max_keep:
         log.debug("pick_diverse_indices: small set", extra={"n": n})
         return list(range(n))
 
-    # ensure embeddings are normalized
+    # ensure normalized
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8
     embs = embeddings / norms
 
-    keep = [0]  # start with first vector
+    keep = [0]
     used = np.zeros(n, dtype=bool)
     used[0] = True
 
     for _ in range(1, max_keep):
-        sims = embs @ embs[keep[-1]].T  # cosine similarity to last kept
+        sims = embs @ embs[keep[-1]].T
         sims = np.clip(sims, -1, 1)
         sims[used] = 1.0
         idx = np.argmin(sims)
         if 1 - sims[idx] < dedupe_cosine:
             break
-        keep.append(idx)
+        keep.append(int(idx))
         used[idx] = True
 
     log.info(
@@ -94,5 +96,4 @@ def pick_diverse_indices(
         extra={"total": n, "kept": len(keep), "dedupe_cosine": dedupe_cosine},
     )
     return keep
-
 
