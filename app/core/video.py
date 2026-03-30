@@ -56,24 +56,11 @@ def pick_diverse_indices(
     max_keep: int = 20,
     dedupe_cosine: float = config.DIVERSITY_COSINE_TOL,
 ) -> list[int]:
-    """
-    Select up to max_keep diverse embeddings by cosine distance.
-
-    Args:
-        embeddings:    (N, D) L2-normalized embeddings
-        max_keep:      max number of diverse samples to keep
-        dedupe_cosine: if the closest unused embedding has cosine distance
-                       less than this, stop early (too similar to add value)
-
-    Returns:
-        list of selected indices into embeddings
-    """
     n = embeddings.shape[0]
     if n <= max_keep:
         log.debug("pick_diverse_indices: small set", extra={"n": n})
         return list(range(n))
 
-    # ensure normalized
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8
     embs = embeddings / norms
 
@@ -96,4 +83,3 @@ def pick_diverse_indices(
         extra={"total": n, "kept": len(keep), "dedupe_cosine": dedupe_cosine},
     )
     return keep
-

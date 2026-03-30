@@ -18,30 +18,82 @@ class Pipeline:
         self.db = LocalStore()
 
     def enroll_image(self, img, person_id, source):
+        """
+        Production-safe single-image enrollment:
+        - softer detector threshold only for enrollment
+        - keep largest face only
+        - reject tiny faces
+        - reject failed alignment
+        - reject low-quality aligned crops
+        """
         log.info("enroll_image_in", extra={"person_id": person_id, "source": source})
 
-        with timed(log, "enroll_detect"):
-            bboxes, kps = self.det.detect(img)
+        from app.core.quality import face_quality_scores, passes_quality
 
-        aligned = []
-        for i in range(len(bboxes)):
-            a = align_5pts(img, kps[i])
-            if a is None:
-                log.warning("enroll_align_none", extra={"person_id": person_id, "idx": i})
-                continue
-            aligned.append(a)
+        orig_thresh = getattr(self.det.detector, "det_thresh", None)
+        try:
+            if orig_thresh is not None:
+                self.det.detector.det_thresh = 0.35  # softer for enrollment
+            with timed(log, "enroll_detect"):
+                bboxes, kps = self.det.detect(img)
+        finally:
+            if orig_thresh is not None:
+                self.det.detector.det_thresh = orig_thresh
 
-        log.info("enroll_align", extra={"aligned": len(aligned)})
+        if len(bboxes) == 0:
+            log.info("enroll_image_no_face", extra={"person_id": person_id, "source": source})
+            return {"faces": 0, "embeddings_added": 0}
 
-        with timed(log, "enroll_embed", faces=len(aligned)):
-            embs = self.emb.embed(aligned)
+        # Keep only the largest detected face
+        areas = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
+        idx = int(np.argmax(areas))
+
+        w = float(bboxes[idx][2] - bboxes[idx][0])
+        h = float(bboxes[idx][3] - bboxes[idx][1])
+        if min(w, h) < config.ENROLL_MIN_FACE_PX:
+            log.info(
+                "enroll_face_too_small",
+                extra={"person_id": person_id, "source": source, "width": w, "height": h},
+            )
+            return {"faces": 1, "embeddings_added": 0}
+
+        aligned = align_5pts(img, kps[idx])
+        if aligned is None:
+            log.warning("enroll_align_none", extra={"person_id": person_id, "source": source})
+            return {"faces": 1, "embeddings_added": 0}
+
+        q = face_quality_scores(aligned)
+        if not passes_quality(q):
+            log.info(
+                "enroll_quality_reject",
+                extra={
+                    "person_id": person_id,
+                    "source": source,
+                    "sharpness": q["sharpness"],
+                    "brightness": q["brightness"],
+                },
+            )
+            return {"faces": 1, "embeddings_added": 0}
+
+        log.info(
+            "enroll_align",
+            extra={
+                "person_id": person_id,
+                "aligned": 1,
+                "sharpness": q["sharpness"],
+                "brightness": q["brightness"],
+            },
+        )
+
+        with timed(log, "enroll_embed", faces=1):
+            embs = self.emb.embed([aligned])
 
         added = self.db.add_embeddings(person_id, embs, source)
         log.info(
             "enroll_image_out",
-            extra={"person_id": person_id, "faces": len(aligned), "embeddings": added},
+            extra={"person_id": person_id, "faces": 1, "embeddings": added},
         )
-        return {"faces": len(aligned), "embeddings_added": added}
+        return {"faces": 1, "embeddings_added": added}
 
     def enroll_video(
         self,
@@ -72,19 +124,23 @@ class Pipeline:
             bboxes, kps = self.det.detect(fr)
             if bboxes.shape[0] == 0:
                 continue
+
             areas = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
             idx = int(np.argmax(areas))
             w = bboxes[idx][2] - bboxes[idx][0]
             h = bboxes[idx][3] - bboxes[idx][1]
             if min(w, h) < min_face_size_px:
                 continue
+
             a = align_5pts(fr, kps[idx])
             if a is None:
                 log.warning("enroll_video_align_none", extra={"person_id": person_id})
                 continue
+
             q = face_quality_scores(a)
             if not passes_quality(q):
                 continue
+
             aligned_faces.append(a)
             qinfo.append(q)
             total_detected += 1
@@ -93,6 +149,14 @@ class Pipeline:
             "video_selected_faces",
             extra={"detected": total_detected, "kept_quality": len(aligned_faces)},
         )
+
+        if not aligned_faces:
+            return {
+                "frames_total": len(frames),
+                "frames_detected": total_detected,
+                "faces_kept": 0,
+                "embeddings_added": 0,
+            }
 
         embs = self.emb.embed(aligned_faces)
         ranked = sorted(
@@ -135,18 +199,23 @@ class Pipeline:
         with timed(log, "recognize_detect"):
             bboxes, kps = self.det.detect(img)
 
-        # Guard against None returns from align_5pts.
-        # A None aligned face would produce a zero-vector embedding
-        # giving cosine similarity ~0 against everything → always "unknown".
         aligned = []
         valid_bboxes = []
         for i, k in enumerate(kps):
+            bbox = bboxes[i]
+            w = float(bbox[2] - bbox[0])
+            h = float(bbox[3] - bbox[1])
+            if min(w, h) < config.RECOG_MIN_FACE_PX:
+                log.warning("recognize_face_too_small", extra={"face_idx": i, "w": w, "h": h})
+                continue
+
             a = align_5pts(img, k)
             if a is None:
                 log.warning("recognize_align_none", extra={"face_idx": i})
                 continue
+
             aligned.append(a)
-            valid_bboxes.append(bboxes[i])
+            valid_bboxes.append(bbox)
 
         log.info("recognize_align", extra={"aligned": len(aligned)})
 

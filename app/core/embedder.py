@@ -1,3 +1,4 @@
+#app/core/embedder.py
 import logging, numpy as np, cv2
 from pathlib import Path
 from insightface.model_zoo.arcface_onnx import ArcFaceONNX

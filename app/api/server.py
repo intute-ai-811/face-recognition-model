@@ -94,14 +94,18 @@ def init_firebase_once():
     with firebase_lock:
         if firebase_initialized:
             return
+
         cred_path = os.getenv("FIREBASE_CREDENTIALS_FILE")
         if not cred_path or not os.path.exists(cred_path):
             raise RuntimeError("FIREBASE_CREDENTIALS_FILE not set or file not found.")
+
         bucket_name = os.getenv("FIREBASE_BUCKET") or _load_bucket_from_google_services()
         if not bucket_name:
             raise RuntimeError("No Firebase bucket configured.")
+
         import firebase_admin
         from firebase_admin import credentials, storage
+
         cred = credentials.Certificate(cred_path)
         firebase_admin.initialize_app(cred, {"storageBucket": bucket_name})
         firebase_bucket = storage.bucket()
@@ -158,6 +162,8 @@ def firebase_upload_bytes(
 @app.on_event("startup")
 def _startup_init_firebase():
     global firebase_error
+    if not UPLOAD_TO_FIREBASE:
+        return
     try:
         init_firebase_once()
     except Exception as e:
@@ -231,7 +237,8 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 def healthz(request: Request):
     global firebase_error
     rid = _request_id(request)
-    if not firebase_initialized and firebase_error is None:
+
+    if UPLOAD_TO_FIREBASE and not firebase_initialized and firebase_error is None:
         try:
             init_firebase_once()
         except Exception as e:
@@ -263,9 +270,10 @@ async def register(
     name: str = Form(""),
     user_id: str = Form(...),
     files: list[UploadFile] = File(...),
-    max_images: int = Query(20, ge=1, le=200),
+    max_images: int = Query(35, ge=1, le=200),
 ):
     from app import config
+
     rid = _request_id(request)
     person_id = str(user_id).strip()
 
@@ -300,7 +308,11 @@ async def register(
 
     cap = min(max_images, getattr(config, "MAX_IMAGES", max_images))
     max_bytes = getattr(config, "MAX_UPLOAD_BYTES", 5 * 1024 * 1024)
-    total_faces = total_emb = processed = errors = 0
+
+    total_faces = 0
+    total_emb = 0
+    processed = 0
+    errors = 0
     uploaded = []
 
     log.info(
@@ -325,6 +337,7 @@ async def register(
                 errors += 1
                 log.warning("register_empty_file", extra={"request_id": rid, "idx": i})
                 continue
+
             if len(raw) > max_bytes:
                 errors += 1
                 log.warning(
@@ -337,6 +350,7 @@ async def register(
                 os.path.basename(getattr(f, "filename", f"frame_{i:04d}.jpg"))
                 or f"frame_{i:04d}.jpg"
             )
+
             arr = np.frombuffer(raw, np.uint8)
             img = await run_in_threadpool(cv2.imdecode, arr, cv2.IMREAD_COLOR)
             if img is None:
@@ -344,11 +358,10 @@ async def register(
                 log.warning("register_decode_fail", extra={"request_id": rid, "idx": i})
                 continue
 
-            res = await run_in_threadpool(
-                PIPE.enroll_image, img, person_id=person_id, source=safe_name
-            )
+            res = await run_in_threadpool(PIPE.enroll_image, img, person_id=person_id, source=safe_name)
             faces = int(res.get("faces", 0))
             embs = int(res.get("embeddings_added", 0))
+
             total_faces += faces
             total_emb += embs
             processed += 1
@@ -366,17 +379,14 @@ async def register(
                             args=(rid, debug_folder, debug_name, debug_bytes, "image/jpeg"),
                             daemon=True,
                         ).start()
-                        uploaded.append(
-                            {"file": debug_name, "folder": debug_folder, "reason": reason}
-                        )
+                        uploaded.append({"file": debug_name, "folder": debug_folder, "reason": reason})
 
         except Exception as e:
             errors += 1
             log.exception("register_frame_error", extra={"request_id": rid, "idx": i, "error": str(e)})
 
-    ok = processed > 0 and total_emb > 0
     summary = {
-        "ok": ok,
+        "ok": total_emb >= config.ENROLL_MIN_GOOD_EMBEDDINGS,
         "request_id": rid,
         "person_id": person_id,
         "person_name": name,
@@ -389,7 +399,7 @@ async def register(
     }
     log.info("api_register_out", extra=summary)
 
-    if not ok:
+    if total_emb == 0:
         return JSONResponse(
             status_code=400,
             content={
@@ -399,6 +409,22 @@ async def register(
                 "details": summary,
             },
         )
+
+    if total_emb < config.ENROLL_MIN_GOOD_EMBEDDINGS:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "insufficient_enrollment",
+                "request_id": rid,
+                "embeddings_added": total_emb,
+                "message": (
+                    f"Only {total_emb} face embeddings captured. Need at least "
+                    f"{config.ENROLL_MIN_GOOD_EMBEDDINGS}. Ensure good lighting and hold face steady."
+                ),
+                "details": summary,
+            },
+        )
+
     return summary
 
 
@@ -407,6 +433,7 @@ async def register(
 async def mark_attendance(request: Request, file: UploadFile = File(...)):
     from app.clients.http import post_json
     from app import config
+
     rid = _request_id(request)
     max_bytes = getattr(config, "MAX_UPLOAD_BYTES", 5 * 1024 * 1024)
 
@@ -436,7 +463,6 @@ async def mark_attendance(request: Request, file: UploadFile = File(...)):
             )
 
         preds = await run_in_threadpool(PIPE.recognize_image, img)
-
         if not preds:
             return JSONResponse(
                 status_code=404,
@@ -579,6 +605,7 @@ async def mark_attendance(request: Request, file: UploadFile = File(...)):
 async def logout(request: Request, file: UploadFile = File(...)):
     from app.clients.http import post_json
     from app import config
+
     rid = _request_id(request)
     max_bytes = getattr(config, "MAX_UPLOAD_BYTES", 5 * 1024 * 1024)
 
@@ -608,7 +635,6 @@ async def logout(request: Request, file: UploadFile = File(...)):
             )
 
         preds = await run_in_threadpool(PIPE.recognize_image, img)
-
         if not preds:
             return JSONResponse(
                 status_code=404,

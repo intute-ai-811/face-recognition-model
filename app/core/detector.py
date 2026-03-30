@@ -1,3 +1,4 @@
+#app/core/detector.py
 import logging, numpy as np
 from pathlib import Path
 from insightface.model_zoo.scrfd import SCRFD
