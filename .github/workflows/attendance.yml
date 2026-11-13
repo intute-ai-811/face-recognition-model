@@ -65,14 +65,23 @@ jobs:
           script: |
             set -eo pipefail
 
-            echo "Pruning old Docker images and containers..."
-            docker system prune -af --volumes || true
+            IMAGE="${REGISTRY}/${IMAGE_NAME}:latest"
+            CONTAINER_NAME="face-recognition-api"
+            APP_DIR="$HOME/face-recognition-model"
+            ENV_FILE="$APP_DIR/app.env"
+
+            # ---- Preflight: host files the container depends on ----
+            for p in "$ENV_FILE" "$APP_DIR/firebase_service.json" \
+                     "$APP_DIR/models/scrfd_2.5g_bnkps.onnx" \
+                     "$APP_DIR/models/w600k_mbf.onnx" "$APP_DIR/data"; do
+              if [ ! -e "$p" ]; then
+                echo "ERROR: missing $p on VPS - aborting, existing container left running."
+                exit 1
+              fi
+            done
 
             echo "Logging in to Docker Hub on VPS..."
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-
-            IMAGE="${REGISTRY}/${IMAGE_NAME}:latest"
-            CONTAINER_NAME="face-recognition-api"
 
             echo "Pulling image: ${IMAGE}"
             docker pull "${IMAGE}"
@@ -86,8 +95,29 @@ jobs:
             docker run -d \
               --name "${CONTAINER_NAME}" \
               --restart unless-stopped \
-              -p 8000:8000 \
+              -p 6900:6900 \
+              --env-file "$ENV_FILE" \
+              -v "$APP_DIR/data:/code/data" \
+              -v "$APP_DIR/models:/code/models:ro" \
+              -v "$APP_DIR/firebase_service.json:/code/firebase_service.json:ro" \
               "${IMAGE}"
+
+            echo "Waiting for /healthz..."
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:6900/healthz >/dev/null 2>&1; then
+                echo "Healthy."
+                break
+              fi
+              if [ "$i" -eq 30 ]; then
+                echo "ERROR: service not healthy after 60s. Recent logs:"
+                docker logs --tail 50 "${CONTAINER_NAME}"
+                exit 1
+              fi
+              sleep 2
+            done
+
+            # Only remove dangling images - never volumes (other apps share this VPS)
+            docker image prune -f || true
 
             echo "Deployment complete. Current status:"
             docker ps --filter "name=${CONTAINER_NAME}"

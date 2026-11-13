@@ -58,8 +58,8 @@ EXPOSE 8000
 
 # Basic liveness check (adjust path if your API differs)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
-  CMD python -c "import urllib.request as u,sys; \
-    sys.exit(0 if u.urlopen('http://127.0.0.1:8000/docs', timeout=3).status < 500 else 1)" || exit 1
+  CMD python -c "import os,urllib.request as u,sys; \
+    sys.exit(0 if u.urlopen('http://127.0.0.1:%s/healthz' % os.getenv('UVICORN_PORT','8000'), timeout=3).status == 200 else 1)" || exit 1
 
 # Start FastAPI
 CMD uvicorn app.api.server:app --host ${UVICORN_HOST} --port ${UVICORN_PORT}
