@@ -64,7 +64,7 @@ async def test_healthz_gated_by_default(server_module, monkeypatch):
 @pytest.mark.asyncio
 async def test_healthz_details_enabled(server_module, monkeypatch):
     monkeypatch.setenv("HEALTHZ_DETAILS", "1")
-    server_module.firebase_error = "RuntimeError: boom"
+    server_module.firebase.error = "RuntimeError: boom"
 
     async with make_async_client(server_module.app) as ac:
         r = await ac.get("/healthz", headers={"X-Request-ID": "rid-hd"})
