@@ -112,4 +112,6 @@ jobs:
             test -z "$(find /code -name "*.jpeg" -o -name "*.jpg" -o -name "*.pkl")"
             test "$(id -u)" = "10001"
             test "$UVICORN_PORT" = "6900"
+            test -f /code/scripts/migrate_pickle_to_sqlite.py
+            python /code/scripts/migrate_pickle_to_sqlite.py --help > /dev/null
           '

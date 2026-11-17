@@ -248,4 +248,4 @@ def test_dockerignore_is_an_allow_list():
         if ln.strip() and not ln.startswith("#")
     ]
     assert lines[0] == "*"
-    assert set(ln for ln in lines if ln.startswith("!")) == {"!app", "!pyproject.toml", "!uv.lock", "!.python-version"}
+    assert set(ln for ln in lines if ln.startswith("!")) == {"!app", "!pyproject.toml", "!uv.lock", "!.python-version", "!scripts/migrate_pickle_to_sqlite.py"}
