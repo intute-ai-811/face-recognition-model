@@ -41,6 +41,11 @@ DIVERSITY_COSINE_TOL: float = 0.05
 # Request/session caps
 MAX_IMAGES: int = 35
 MAX_UPLOAD_BYTES: int = 5 * 1024 * 1024
+# Largest decoded image accepted (width x height). Larger images fail to decode
+# and get the existing "Invalid image" response, preventing decompression bombs.
+MAX_IMAGE_PIXELS: int = 50_000_000
+# Whole-request cap, checked against Content-Length before the body is parsed.
+MAX_REQUEST_BYTES: int = MAX_IMAGES * MAX_UPLOAD_BYTES + 1024 * 1024
 ENROLL_MIN_GOOD_EMBEDDINGS: int = 5
 
 # ── ERP Integration ──────────────────────────────────────────────────────────
