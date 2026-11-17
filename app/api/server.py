@@ -526,7 +526,7 @@ async def mark_attendance(request: Request, file: UploadFile = File(...)):
             )
 
         preds = await run_in_threadpool(PIPE.recognize_image, img)
-        if not preds:
+        if preds is None or len(preds) == 0:
             return JSONResponse(
                 status_code=404,
                 content={"status": "no_face", "request_id": rid, "message": "No face detected."},
@@ -694,7 +694,7 @@ async def logout(request: Request, file: UploadFile = File(...)):
             )
 
         preds = await run_in_threadpool(PIPE.recognize_image, img)
-        if not preds:
+        if preds is None or len(preds) == 0:
             return JSONResponse(
                 status_code=404,
                 content={"status": "no_face", "request_id": rid, "message": "No face detected."},
