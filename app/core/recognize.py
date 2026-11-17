@@ -30,15 +30,10 @@ class Pipeline:
 
         from app.core.quality import face_quality_scores, passes_quality
 
-        orig_thresh = getattr(self.det.detector, "det_thresh", None)
-        try:
-            if orig_thresh is not None:
-                self.det.detector.det_thresh = 0.35  # softer for enrollment
-            with timed(log, "enroll_detect"):
-                bboxes, kps = self.det.detect(img)
-        finally:
-            if orig_thresh is not None:
-                self.det.detector.det_thresh = orig_thresh
+        # Softer threshold for enrollment, passed per call so the shared detector
+        # is never mutated while recognition requests run concurrently.
+        with timed(log, "enroll_detect"):
+            bboxes, kps = self.det.detect(img, min_score=config.ENROLL_DET_SCORE_THRESH)
 
         if len(bboxes) == 0:
             log.info("enroll_image_no_face", extra={"person_id": person_id, "source": source})
@@ -229,14 +224,15 @@ class Pipeline:
 
         out = []
         for i in range(len(valid_bboxes)):
-            best = sims[i][0] if sims[i] else {"person_id": "unknown", "score": 0.0}
+            cands = sims[i] if i < len(sims) else []
+            best = cands[0] if cands else {"person_id": "unknown", "score": 0.0}
             label = best["person_id"] if best["score"] >= config.SIMILARITY_THRESHOLD else "unknown"
             out.append(
                 {
                     "bbox": valid_bboxes[i][:4].tolist(),
                     "score": float(valid_bboxes[i][4]),
                     "prediction": {"person_id": label, "similarity": best["score"]},
-                    "top_k": sims[i],
+                    "top_k": cands,
                 }
             )
 

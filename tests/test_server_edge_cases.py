@@ -118,15 +118,13 @@ async def test_mark_attendance_numpy_empty_preds_404(server_module, monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_mark_attendance_preds_dict_is_wrapped_and_succeeds(server_module, monkeypatch, config_module, dummy_img):
+async def test_mark_attendance_pipeline_dict_is_not_supported_returns_500(server_module, monkeypatch, config_module, dummy_img):
     """
-    Server wraps non-list preds into list; should still work.
+    Pipeline.recognize_image always returns a list. The old dict-wrapping
+    behaviour was removed; a dict now falls through to the generic 500 handler.
     """
     rid = "rid-dict"
     monkeypatch.setattr(server_module.cv2, "imdecode", lambda arr, mode: dummy_img)
-    monkeypatch.setattr(config_module, "ATTEND_AUTO_THRESHOLD", 0.75, raising=False)
-    monkeypatch.setattr(config_module, "ATTEND_MAYBE_THRESHOLD", 0.60, raising=False)
-    monkeypatch.setattr(config_module, "ERP_ATTENDANCE_URL", "http://erp/attendance", raising=False)
 
     class Pipe:
         def recognize_image(self, img):
@@ -134,6 +132,57 @@ async def test_mark_attendance_preds_dict_is_wrapped_and_succeeds(server_module,
 
     server_module.PIPE = Pipe()
 
+    async with make_async_client(server_module.app) as ac:
+        r = await ac.post(
+            "/mark_attendance",
+            headers={"X-Request-ID": rid},
+            files={"file": ("x.jpg", b"abc", "image/jpeg")},
+        )
+
+    assert r.status_code == 500
+    assert r.json()["status"] == "error"
+    assert r.json()["request_id"] == rid
+
+@pytest.mark.asyncio
+async def test_mark_attendance_unknown_below_threshold_returns_no_match(server_module, monkeypatch, config_module, dummy_img):
+    """Below SIMILARITY_THRESHOLD the pipeline labels the face 'unknown' -> 404 no_match."""
+    rid = "rid-nm"
+    monkeypatch.setattr(server_module.cv2, "imdecode", lambda arr, mode: dummy_img)
+
+    class Pipe:
+        def recognize_image(self, img):
+            return [{"prediction": {"person_id": "unknown", "similarity": 0.49}, "top_k": []}]
+
+    server_module.PIPE = Pipe()
+
+    async with make_async_client(server_module.app) as ac:
+        r = await ac.post(
+            "/mark_attendance",
+            headers={"X-Request-ID": rid},
+            files={"file": ("x.jpg", b"abc", "image/jpeg")},
+        )
+
+    assert r.status_code == 404
+    body = r.json()
+    assert body["status"] == "no_match"
+    assert body["best"]["similarity"] == 0.49
+    assert body["request_id"] == rid
+
+@pytest.mark.asyncio
+async def test_mark_attendance_single_level_match_is_marked(server_module, monkeypatch, config_module, dummy_img):
+    """Single-level matching: any labelled match (here 0.70) is marked; there is no low_confidence tier."""
+    rid = "rid-lc"
+    monkeypatch.setattr(server_module.cv2, "imdecode", lambda arr, mode: dummy_img)
+    monkeypatch.setattr(config_module, "ERP_ATTENDANCE_URL", "http://erp/attendance", raising=False)
+
+    class Pipe:
+        def recognize_image(self, img):
+            return [{
+                "prediction": {"person_id": "72", "similarity": 0.70},
+                "top_k": [{"person_id": "72", "score": 0.70}],
+            }]
+
+    server_module.PIPE = Pipe()
     import app.clients.http as http_client
 
     async def ok_post_json(url, payload):
@@ -149,63 +198,10 @@ async def test_mark_attendance_preds_dict_is_wrapped_and_succeeds(server_module,
         )
 
     assert r.status_code == 200
-    assert r.json()["status"] == "marked"
-    assert r.json()["request_id"] == rid
-
-
-@pytest.mark.asyncio
-async def test_mark_attendance_no_match_below_maybe_threshold(server_module, monkeypatch, config_module, dummy_img):
-    rid = "rid-nm"
-    monkeypatch.setattr(server_module.cv2, "imdecode", lambda arr, mode: dummy_img)
-    monkeypatch.setattr(config_module, "ATTEND_MAYBE_THRESHOLD", 0.60, raising=False)
-
-    class Pipe:
-        def recognize_image(self, img):
-            return [{"prediction": {"person_id": "72", "similarity": 0.50}, "top_k": []}]
-
-    server_module.PIPE = Pipe()
-
-    async with make_async_client(server_module.app) as ac:
-        r = await ac.post(
-            "/mark_attendance",
-            headers={"X-Request-ID": rid},
-            files={"file": ("x.jpg", b"abc", "image/jpeg")},
-        )
-
-    assert r.status_code == 404
     body = r.json()
-    assert body["status"] == "no_match"
+    assert body["status"] == "marked"
+    assert body["user_id"] == 72
     assert body["request_id"] == rid
-
-
-@pytest.mark.asyncio
-async def test_mark_attendance_low_confidence_between_thresholds(server_module, monkeypatch, config_module, dummy_img):
-    rid = "rid-lc"
-    monkeypatch.setattr(server_module.cv2, "imdecode", lambda arr, mode: dummy_img)
-    monkeypatch.setattr(config_module, "ATTEND_MAYBE_THRESHOLD", 0.60, raising=False)
-    monkeypatch.setattr(config_module, "ATTEND_AUTO_THRESHOLD", 0.75, raising=False)
-
-    class Pipe:
-        def recognize_image(self, img):
-            return [{
-                "prediction": {"person_id": "72", "similarity": 0.70},
-                "top_k": [{"person_id": "72", "similarity": 0.70}],
-            }]
-
-    server_module.PIPE = Pipe()
-
-    async with make_async_client(server_module.app) as ac:
-        r = await ac.post(
-            "/mark_attendance",
-            headers={"X-Request-ID": rid},
-            files={"file": ("x.jpg", b"abc", "image/jpeg")},
-        )
-
-    assert r.status_code == 409
-    body = r.json()
-    assert body["status"] == "low_confidence"
-    assert body["request_id"] == rid
-
 
 @pytest.mark.asyncio
 async def test_mark_attendance_mapping_error_when_label_not_in_map(server_module, monkeypatch, config_module, dummy_img):
@@ -422,25 +418,29 @@ async def test_logout_no_match_404(server_module, monkeypatch, config_module, du
 
 
 @pytest.mark.asyncio
-async def test_logout_low_confidence_409(server_module, monkeypatch, config_module, dummy_img):
+async def test_logout_single_level_match_is_logged_out(server_module, monkeypatch, config_module, dummy_img):
+    """Single-level matching on logout: a labelled match at 0.70 is logged out; no low_confidence tier."""
     monkeypatch.setattr(server_module.cv2, "imdecode", lambda arr, mode: dummy_img)
-    monkeypatch.setattr(config_module, "ATTEND_MAYBE_THRESHOLD", 0.60, raising=False)
-    monkeypatch.setattr(config_module, "ATTEND_AUTO_THRESHOLD", 0.75, raising=False)
 
-    class PipeLowConf:
+    class PipeMatch:
         def recognize_image(self, img):
-            return [{"prediction": {"person_id": "72", "similarity": 0.70}, "top_k": [{"person_id": "72", "similarity": 0.70}]}]
+            return [{"prediction": {"person_id": "72", "similarity": 0.70}, "top_k": [{"person_id": "72", "score": 0.70}]}]
 
-    server_module.PIPE = PipeLowConf()
+    server_module.PIPE = PipeMatch()
+    import app.clients.http as http_client
+
+    async def ok_post_json(url, payload):
+        return 200, {"ok": True}
+
+    monkeypatch.setattr(http_client, "post_json", ok_post_json)
 
     async with make_async_client(server_module.app) as ac:
         r = await ac.post("/logout", files={"file": ("x.jpg", b"abc", "image/jpeg")})
 
-    assert r.status_code == 409
+    assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "low_confidence"
+    assert body["status"] == "logged_out"
     assert "request_id" in body
-
 
 @pytest.mark.asyncio
 async def test_logout_mapping_error_409(server_module, monkeypatch, config_module, dummy_img):
