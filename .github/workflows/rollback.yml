@@ -27,7 +27,7 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           password: ${{ secrets.VPS_PASSWORD }}
           port: 22
-          script_stop: true
+          # No script_stop (see attendance.yml); the script uses 'set -eo pipefail'.
           envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,REGISTRY,IMAGE_NAME,TARGET
           script: |
             set -eo pipefail
