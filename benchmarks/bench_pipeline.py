@@ -134,13 +134,11 @@ def bench_matching(people_counts: list[int], templates: int, queries: int) -> di
         rss_after = rss_mb()
         q = rng.standard_normal((1, config.EMB_DIM)).astype(np.float32)
         reps = max(3, min(queries, int(2000 / max(1, total / 1000))))
-        search = store.search_cosine
-        ms = timeit(lambda: search(q, top_k=config.TOP_K), reps, warmup=1)
+        ms = timeit(lambda: store.search_cosine(q, top_k=config.TOP_K), reps, warmup=1)
         out[str(n)] = {"templates": total, "search": summarize(ms),
                        "index_rss_delta_mb": round(rss_after - rss_before, 1)}
         print(f"  {n:>7} people x {templates} templates: p50 {out[str(n)]['search']['p50_ms']} ms, "
               f"p95 {out[str(n)]['search']['p95_ms']} ms, index ~{out[str(n)]['index_rss_delta_mb']} MB", flush=True)
-        del store, search, embs
     return out
 
 
