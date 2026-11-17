@@ -6,6 +6,8 @@
 !pyproject.toml
 !uv.lock
 !.python-version
+# One operator script, so the SQLite migration can run inside the production container.
+!scripts/migrate_pickle_to_sqlite.py
 
 # Never ship caches, even from inside app/
 **/__pycache__

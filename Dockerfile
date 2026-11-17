@@ -55,6 +55,7 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /code
 COPY --chown=${APP_USER}:${APP_GROUP} app/ /code/app/
+COPY --chown=${APP_USER}:${APP_GROUP} scripts/migrate_pickle_to_sqlite.py /code/scripts/migrate_pickle_to_sqlite.py
 
 # Mount points; real content comes from host volumes.
 RUN mkdir -p /code/data/faces /code/models "$XDG_CACHE_HOME" \

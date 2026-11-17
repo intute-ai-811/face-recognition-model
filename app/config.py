@@ -11,6 +11,7 @@ FACES_DIR: Path = DATA_DIR / "faces"
 EMBED_DIR: Path = DATA_DIR / "embeddings"
 EMBED_INDEX_FILE: Path = EMBED_DIR / "index.pkl"
 PEOPLE_FILE: Path = DATA_DIR / "people.pkl"
+DB_FILE: Path = DATA_DIR / "attendance.db"
 
 # ── Models ───────────────────────────────────────────────────────────────────
 SCRFD_MODEL: Path = Path(os.getenv("SCRFD_MODEL", str(MODELS_DIR / "scrfd_2.5g_bnkps.onnx")))

@@ -5,7 +5,7 @@ import numpy as np
 from app.core.detector import FaceDetector
 from app.core.align import align_5pts
 from app.core.embedder import FaceEmbedder
-from app.core.storage import LocalStore
+from app.core.store_factory import create_store
 from app.logging_config import timed, get_logger
 from app import config
 
@@ -16,7 +16,7 @@ class Pipeline:
     def __init__(self):
         self.det = FaceDetector()
         self.emb = FaceEmbedder()
-        self.db = LocalStore()
+        self.db = create_store()
         if os.getenv("MODEL_WARMUP", "1") == "1":
             self.warmup()
 

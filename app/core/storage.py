@@ -31,6 +31,61 @@ class _MatchSnapshot:
     person_ids: tuple[str, ...]  # length N, row-aligned with db_norm
 
 
+def build_snapshot(embeddings: list[np.ndarray], person_ids: list[str], emb_dim: int) -> _MatchSnapshot:
+    """L2-normalise and freeze. Shared by every storage backend so matching is identical."""
+    if embeddings:
+        matrix = np.vstack(embeddings).astype(np.float32, copy=False)
+        db_norm = matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12)
+    else:
+        db_norm = np.zeros((0, emb_dim), np.float32)
+    db_norm.setflags(write=False)
+    return _MatchSnapshot(db_norm, tuple(person_ids))
+
+
+def search_snapshot(snap: _MatchSnapshot, q: np.ndarray, top_k: int, emb_dim: int) -> list[list[dict]]:
+    """Max cosine per person over all templates, top_k people per query. Shared by every backend."""
+    if q.ndim == 1:
+        q = q.reshape(1, -1)
+    if q.ndim != 2:
+        raise ValueError(f"search_cosine expected 2D query, got shape {q.shape}")
+    if q.shape[1] != emb_dim:
+        raise ValueError(f"search_cosine query dim={q.shape[1]} but store emb_dim={emb_dim}")
+
+    if len(snap.person_ids) == 0:
+        log.info("search_empty")
+        return [[] for _ in range(q.shape[0])]
+
+    with timed(log, "search_cosine", queries=int(q.shape[0]), db_size=len(snap.person_ids)):
+        q_norm = q / (np.linalg.norm(q, axis=1, keepdims=True) + 1e-12)
+        sims = q_norm @ snap.db_norm.T
+
+        results = []
+        for i in range(q.shape[0]):
+            agg = {}
+            for j, pid in enumerate(snap.person_ids):
+                s = float(sims[i, j])
+                if (pid not in agg) or (s > agg[pid]):
+                    agg[pid] = s
+            ranked = sorted(
+                ({"person_id": pid, "score": sc} for pid, sc in agg.items()),
+                key=lambda x: -x["score"],
+            )[:top_k]
+            results.append(ranked)
+
+    log.info(
+        "search_done",
+        extra={"queries": int(q.shape[0]), "unique_people": len(set(snap.person_ids)), "top_k": top_k},
+    )
+    return results
+
+
+def snapshot_counts(snap: _MatchSnapshot) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for pid in snap.person_ids:
+        counts[pid] = counts.get(pid, 0) + 1
+    return counts
+
+
 def _generation_path(path: Path, n: int) -> Path:
     return path.with_name(f"{path.name}.{n}")
 
@@ -120,6 +175,20 @@ def load_pickle_with_fallback(path: Path, generations: int = BACKUP_GENERATIONS)
                     extra={"backup": str(gen), "error": repr(gen_err)},
                 )
         raise primary_err
+
+
+def save_aligned_crop(person_id: str, aligned_img) -> None:
+    if aligned_img is None:
+        log.warning("save_aligned_none", extra={"person_id": person_id})
+        return
+    try:
+        import cv2
+        save_dir = config.FACES_DIR / str(person_id)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        fname = f"{int(time.time() * 1000)}.jpg"
+        cv2.imwrite(str(save_dir / fname), aligned_img)
+    except Exception as e:
+        log.warning("save_aligned_failed", extra={"person_id": person_id, "error": str(e)})
 
 
 class LocalStore:
@@ -241,15 +310,10 @@ class LocalStore:
                         f"Back up {self.index_file} and re-enroll."
                     )
 
-            if records:
-                matrix = np.vstack([r.embedding for r in records])
-                db_norm = matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12)
-            else:
-                db_norm = np.zeros((0, self.emb_dim), np.float32)
-            db_norm.setflags(write=False)
-
             # Single reference assignment: searches see either the old or the new snapshot.
-            self._snapshot = _MatchSnapshot(db_norm, tuple(r.person_id for r in records))
+            self._snapshot = build_snapshot(
+                [r.embedding for r in records], [r.person_id for r in records], self.emb_dim
+            )
 
         log.info(
             "cache_rebuilt",
@@ -304,50 +368,11 @@ class LocalStore:
         return int(embs.shape[0])
 
     def search_cosine(self, q: np.ndarray, top_k: int) -> list[list[dict]]:
-        if q.ndim == 1:
-            q = q.reshape(1, -1)
-        if q.ndim != 2:
-            raise ValueError(f"search_cosine expected 2D query, got shape {q.shape}")
-        if q.shape[1] != self.emb_dim:
-            raise ValueError(f"search_cosine query dim={q.shape[1]} but store emb_dim={self.emb_dim}")
-
         # Read the snapshot reference exactly once so matrix rows and ids always belong together.
-        snap = self._snapshot
-        if len(snap.person_ids) == 0:
-            log.info("search_empty")
-            return [[] for _ in range(q.shape[0])]
-
-        with timed(log, "search_cosine", queries=int(q.shape[0]), db_size=len(snap.person_ids)):
-            q_norm = q / (np.linalg.norm(q, axis=1, keepdims=True) + 1e-12)
-            sims = q_norm @ snap.db_norm.T
-
-            results = []
-            for i in range(q.shape[0]):
-                agg = {}
-                for j, pid in enumerate(snap.person_ids):
-                    s = float(sims[i, j])
-                    if (pid not in agg) or (s > agg[pid]):
-                        agg[pid] = s
-                ranked = sorted(
-                    ({"person_id": pid, "score": sc} for pid, sc in agg.items()),
-                    key=lambda x: -x["score"],
-                )[:top_k]
-                results.append(ranked)
-
-        log.info(
-            "search_done",
-            extra={
-                "queries": int(q.shape[0]),
-                "unique_people": len(set(snap.person_ids)),
-                "top_k": top_k,
-            },
-        )
-        return results
+        return search_snapshot(self._snapshot, q, top_k, self.emb_dim)
 
     def people(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for pid in self._snapshot.person_ids:
-            counts[pid] = counts.get(pid, 0) + 1
+        counts = snapshot_counts(self._snapshot)
         log.info("people_summary", extra={"unique_people": len(counts)})
         return counts
 
@@ -370,17 +395,7 @@ class LocalStore:
         return int(removed)
 
     def save_aligned(self, person_id: str, aligned_img) -> None:
-        if aligned_img is None:
-            log.warning("save_aligned_none", extra={"person_id": person_id})
-            return
-        try:
-            import cv2
-            save_dir = config.FACES_DIR / str(person_id)
-            save_dir.mkdir(parents=True, exist_ok=True)
-            fname = f"{int(time.time() * 1000)}.jpg"
-            cv2.imwrite(str(save_dir / fname), aligned_img)
-        except Exception as e:
-            log.warning("save_aligned_failed", extra={"person_id": person_id, "error": str(e)})
+        save_aligned_crop(person_id, aligned_img)
 
     def reload(self) -> None:
         log.info("store_reload")
