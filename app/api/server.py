@@ -1,233 +1,53 @@
-#app/api/server.py
-import logging
-import time
-import cv2
-import numpy as np
-import os
-import json
-import io
-import uuid
-import hmac
-from typing import Optional, Tuple
-import threading
-import pickle
-from fastapi import Header, HTTPException
-from fastapi import FastAPI, UploadFile, File, Query, Form
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from starlette.requests import Request
-from starlette.concurrency import run_in_threadpool
-from app import config as app_config
-from app.logging_config import setup_logging
-from app.core.recognize import Pipeline
+# app/api/server.py
+"""
+FastAPI application: setup, middleware, error handlers and thin route handlers.
 
+Business logic lives in app/services (attendance, enrollment, admin), request
+helpers in app/api/uploads.py, auth in app/api/security.py and Firebase in
+app/infrastructure/firebase.py. The public API is frozen by tests/test_api_contract.py.
+
+Entry point (unchanged): uvicorn app.api.server:app
+"""
+import logging
+import os
+import threading
+import time
+from contextlib import asynccontextmanager
+from typing import Optional
+
+import cv2  # noqa: F401  (re-exported: tests patch server.cv2.imdecode)
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
+from starlette.requests import Request
+
+from app import config as app_config
+from app.api.security import require_admin, require_enroll_key
+from app.api.uploads import request_id
+from app.core.recognize import Pipeline
+from app.infrastructure.firebase import FirebaseClient
+from app.logging_config import setup_logging
+from app.services import admin as admin_service
+from app.services.attendance import CHECK_IN, CHECK_OUT, recognize_and_report
+from app.services.enrollment import enroll_person
+
+setup_logging()
+log = logging.getLogger(__name__)
+
+# Module-level singletons, looked up at request time (tests replace PIPE / firebase).
+PIPE = Pipeline()
+firebase = FirebaseClient()
 admin_lock = threading.Lock()
 
 
-def _token_matches(given: Optional[str], expected: Optional[str]) -> bool:
-    if not given or not expected:
-        return False
-    return hmac.compare_digest(given.encode(), expected.encode())
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    firebase.try_init("startup")
+    yield
 
 
-def _require_admin(x_admin_token: Optional[str]) -> None:
-    expected = os.getenv("ADMIN_TOKEN")
-    if not expected:
-        raise HTTPException(status_code=503, detail="Admin endpoints disabled (ADMIN_TOKEN not set).")
-    if not _token_matches(x_admin_token, expected):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-def _require_enroll_key(x_enroll_token: Optional[str], x_admin_token: Optional[str]) -> None:
-    """
-    Enrollment authentication, off by default (ENROLL_REQUIRE_KEY=0) so existing
-    kiosk clients keep working. When enabled, /register needs X-Enroll-Token
-    matching ENROLL_TOKEN, or X-Admin-Token matching ADMIN_TOKEN.
-    """
-    if os.getenv("ENROLL_REQUIRE_KEY", "0") != "1":
-        return
-    enroll_token = os.getenv("ENROLL_TOKEN")
-    admin_token = os.getenv("ADMIN_TOKEN")
-    if not enroll_token and not admin_token:
-        raise HTTPException(
-            status_code=503,
-            detail="Enrollment disabled (ENROLL_REQUIRE_KEY=1 but no ENROLL_TOKEN/ADMIN_TOKEN set).",
-        )
-    if _token_matches(x_enroll_token, enroll_token) or _token_matches(x_admin_token, admin_token):
-        return
-    raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-async def _read_upload_capped(f: UploadFile, max_bytes: int) -> bytes:
-    """Read at most max_bytes + 1 bytes, so an oversized file is detected without loading it whole."""
-    try:
-        return await f.read(max_bytes + 1)
-    finally:
-        await f.close()
-
-
-def _decode_image(raw: bytes):
-    """
-    Decode with a pixel cap. The header is read first (cheap) so a small file that
-    expands to a huge image is rejected before allocation. Returns None on failure,
-    which callers already map to their existing "invalid image" responses.
-    """
-    max_pixels = getattr(app_config, "MAX_IMAGE_PIXELS", 50_000_000)
-    try:
-        from PIL import Image
-        with Image.open(io.BytesIO(raw)) as im:
-            w, h = im.size
-        if w * h > max_pixels:
-            logging.getLogger(__name__).warning("image_too_many_pixels", extra={"w": w, "h": h})
-            return None
-    except Exception:
-        pass  # Not a format Pillow knows; OpenCV decides, then the post-decode check applies.
-    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
-    if img is not None and img.shape[0] * img.shape[1] > max_pixels:
-        logging.getLogger(__name__).warning("image_too_many_pixels", extra={"w": img.shape[1], "h": img.shape[0]})
-        return None
-    return img
-
-
-def _people_dump() -> dict:
-    try:
-        if hasattr(PIPE, "db") and hasattr(PIPE.db, "people"):
-            data = PIPE.db.people()
-            return dict(data) if isinstance(data, dict) else {"people": data}
-    except Exception:
-        pass
-    from app import config
-    if not config.PEOPLE_FILE.exists():
-        return {}
-    with open(config.PEOPLE_FILE, "rb") as f:
-        obj = pickle.load(f)
-    return dict(obj) if isinstance(obj, dict) else {"people": obj}
-
-
-def _try_remove_person(person_id: str) -> dict:
-    if hasattr(PIPE, "db"):
-        db = PIPE.db
-        for meth in ("remove_person", "delete_person", "drop_person"):
-            if hasattr(db, meth):
-                fn = getattr(db, meth)
-                out = fn(person_id)
-                return {"removed_via": f"PIPE.db.{meth}", "result": out}
-    raise HTTPException(status_code=500, detail="No deletion method found on storage layer.")
-
-
-# ─────────────── Setup ───────────────
-setup_logging()
-app = FastAPI(title="Attendance Face API")
-log = logging.getLogger(__name__)
-PIPE = Pipeline()
-
-# ───────────── Firebase Setup ─────────────
-firebase_initialized = False
-firebase_bucket = None
-firebase_error: str | None = None
-firebase_lock = threading.Lock()
-
-
-def _request_id(request: Optional[Request]) -> str:
-    if request is None:
-        return str(uuid.uuid4())
-    rid = request.headers.get("x-request-id")
-    return rid or str(uuid.uuid4())
-
-
-def _load_bucket_from_google_services(gs_path: str = "google-services.json") -> Optional[str]:
-    if not os.path.exists(gs_path):
-        return None
-    with open(gs_path, "r") as f:
-        cfg = json.load(f)
-    try:
-        return cfg["project_info"]["storage_bucket"]
-    except Exception:
-        return None
-
-
-def init_firebase_once():
-    global firebase_initialized, firebase_bucket
-    if firebase_initialized:
-        return
-    with firebase_lock:
-        if firebase_initialized:
-            return
-
-        cred_path = os.getenv("FIREBASE_CREDENTIALS_FILE")
-        if not cred_path or not os.path.exists(cred_path):
-            raise RuntimeError("FIREBASE_CREDENTIALS_FILE not set or file not found.")
-
-        bucket_name = os.getenv("FIREBASE_BUCKET") or _load_bucket_from_google_services()
-        if not bucket_name:
-            raise RuntimeError("No Firebase bucket configured.")
-
-        import firebase_admin
-        from firebase_admin import credentials, storage
-
-        cred = credentials.Certificate(cred_path)
-        firebase_admin.initialize_app(cred, {"storageBucket": bucket_name})
-        firebase_bucket = storage.bucket()
-        firebase_initialized = True
-        logging.getLogger(__name__).info("Firebase initialized", extra={"bucket": bucket_name})
-
-
-UPLOAD_TO_FIREBASE = os.getenv("UPLOAD_TO_FIREBASE", "0") == "1"
-
-
-def _encode_debug_jpg(img: np.ndarray, max_w: int = 640, quality: int = 80) -> bytes:
-    h, w = img.shape[:2]
-    if w > max_w:
-        new_h = int(h * (max_w / w))
-        img = cv2.resize(img, (max_w, new_h))
-    ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-    return enc.tobytes() if ok else b""
-
-
-def _bg_firebase_upload(rid: str, folder: str, filename: str, data: bytes, content_type: str):
-    try:
-        gs_url, public_url = firebase_upload_bytes(folder, filename, data, content_type)
-        logging.getLogger(__name__).info(
-            "firebase_upload_ok",
-            extra={"request_id": rid, "file": filename, "gs_url": gs_url, "public_url": public_url},
-        )
-    except Exception as e:
-        logging.getLogger(__name__).exception(
-            "firebase_upload_failed",
-            extra={"request_id": rid, "file": filename, "error": str(e)},
-        )
-
-
-def firebase_upload_bytes(
-    folder_path: str,
-    filename: str,
-    data: bytes,
-    content_type: str = "image/jpeg",
-) -> Tuple[str, str]:
-    init_firebase_once()
-    blob_path = f"{folder_path.rstrip('/')}/{os.path.basename(filename)}"
-    blob = firebase_bucket.blob(blob_path)
-    blob.upload_from_file(io.BytesIO(data), content_type=content_type)
-    # Objects stay private: these are employee face images. public_url is kept
-    # (empty) for response compatibility.
-    public_url = ""
-    gs_url = f"gs://{firebase_bucket.name}/{blob_path}"
-    return gs_url, public_url
-
-
-# ───────────── Init on startup ─────────────
-@app.on_event("startup")
-def _startup_init_firebase():
-    global firebase_error
-    if not UPLOAD_TO_FIREBASE:
-        return
-    try:
-        init_firebase_once()
-    except Exception as e:
-        firebase_error = f"{type(e).__name__}: {e}"
-        logging.getLogger(__name__).warning(
-            "Firebase init failed on startup", extra={"error": firebase_error}
-        )
+app = FastAPI(title="Attendance Face API", lifespan=lifespan)
 
 
 # ───────────── Middleware ─────────────
@@ -238,7 +58,7 @@ async def request_size_limit(request: Request, call_next):
     if limit and length and length.isdigit() and int(length) > limit:
         return JSONResponse(
             status_code=413,
-            content={"status": "error", "request_id": _request_id(request), "message": "Request too large"},
+            content={"status": "error", "request_id": request_id(request), "message": "Request too large"},
         )
     return await call_next(request)
 
@@ -246,37 +66,21 @@ async def request_size_limit(request: Request, call_next):
 @app.middleware("http")
 async def http_logger(request: Request, call_next):
     start = time.perf_counter()
-    path = request.url.path
-    method = request.method
-    client = request.client.host if request.client else "unknown"
-    rid = _request_id(request)
+    fields = {
+        "request_id": request_id(request),
+        "method": request.method,
+        "path": request.url.path,
+        "client": request.client.host if request.client else "unknown",
+    }
     try:
         response = await call_next(request)
-        dt = int((time.perf_counter() - start) * 1000)
         logging.getLogger("app.http").info(
-            "http",
-            extra={
-                "request_id": rid,
-                "method": method,
-                "path": path,
-                "status": response.status_code,
-                "client": client,
-                "ms": dt,
-            },
+            "http", extra={**fields, "status": response.status_code, "ms": int((time.perf_counter() - start) * 1000)}
         )
         return response
     except Exception as e:
-        dt = int((time.perf_counter() - start) * 1000)
         logging.getLogger("app.http").exception(
-            "http_error",
-            extra={
-                "request_id": rid,
-                "method": method,
-                "path": path,
-                "client": client,
-                "ms": dt,
-                "error": str(e),
-            },
+            "http_error", extra={**fields, "ms": int((time.perf_counter() - start) * 1000), "error": str(e)}
         )
         raise
 
@@ -284,46 +88,33 @@ async def http_logger(request: Request, call_next):
 # ───────────── Errors ─────────────
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    rid = _request_id(request)
     return JSONResponse(
         status_code=422,
-        content={"error": "validation_error", "request_id": rid, "details": exc.errors()},
+        content={"error": "validation_error", "request_id": request_id(request), "details": exc.errors()},
     )
 
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    rid = _request_id(request)
+    rid = request_id(request)
     logging.getLogger("app.api.server").exception("unhandled_exception", extra={"request_id": rid})
-    return JSONResponse(
-        status_code=500,
-        content={"error": "internal_server_error", "request_id": rid},
-    )
+    return JSONResponse(status_code=500, content={"error": "internal_server_error", "request_id": rid})
 
 
 # ───────────── Health ─────────────
 @app.get("/healthz")
 def healthz(request: Request):
-    global firebase_error
-    rid = _request_id(request)
-
-    if UPLOAD_TO_FIREBASE and not firebase_initialized and firebase_error is None:
-        try:
-            init_firebase_once()
-        except Exception as e:
-            firebase_error = f"{type(e).__name__}: {e}"
-
-    bucket_name = getattr(firebase_bucket, "name", None)
-    show_details = os.getenv("HEALTHZ_DETAILS", "0") == "1"
+    if firebase.enabled and not firebase.initialized and firebase.error is None:
+        firebase.try_init("/healthz")
 
     resp = {
         "status": "ok",
-        "request_id": rid,
-        "firebase_ready": firebase_initialized,
-        "firebase_bucket": bucket_name,
+        "request_id": request_id(request),
+        "firebase_ready": firebase.initialized,
+        "firebase_bucket": getattr(firebase.bucket, "name", None),
     }
-    if show_details:
-        resp["firebase_error"] = firebase_error
+    if os.getenv("HEALTHZ_DETAILS", "0") == "1":
+        resp["firebase_error"] = firebase.error
         resp["env_seen"] = {
             "FIREBASE_CREDENTIALS_FILE": os.environ.get("FIREBASE_CREDENTIALS_FILE"),
             "FIREBASE_BUCKET": os.environ.get("FIREBASE_BUCKET"),
@@ -332,7 +123,7 @@ def healthz(request: Request):
     return resp
 
 
-# ───────────── Register ─────────────
+# ───────────── Enrollment ─────────────
 @app.post("/register")
 async def register(
     request: Request,
@@ -343,504 +134,28 @@ async def register(
     x_enroll_token: Optional[str] = Header(default=None),
     x_admin_token: Optional[str] = Header(default=None),
 ):
-    from app import config
-
-    _require_enroll_key(x_enroll_token, x_admin_token)
-    rid = _request_id(request)
-    person_id = str(user_id).strip()
-
-    if not person_id:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "request_id": rid, "message": "user_id required"},
-        )
-    if not files:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "request_id": rid, "message": "No files[] received"},
-        )
-
-    try:
-        if hasattr(PIPE, "db") and hasattr(PIPE.db, "set_person"):
-            PIPE.db.set_person(person_id, name)
-    except Exception as e:
-        log.warning(
-            "set_person_name_failed",
-            extra={"request_id": rid, "person_id": person_id, "error": str(e)},
-        )
-
-    if UPLOAD_TO_FIREBASE:
-        try:
-            init_firebase_once()
-        except Exception as e:
-            logging.getLogger(__name__).warning(
-                "Firebase init on /register failed",
-                extra={"request_id": rid, "error": str(e)},
-            )
-
-    cap = min(max_images, getattr(config, "MAX_IMAGES", max_images))
-    max_bytes = getattr(config, "MAX_UPLOAD_BYTES", 5 * 1024 * 1024)
-
-    total_faces = 0
-    total_emb = 0
-    processed = 0
-    errors = 0
-    uploaded = []
-
-    log.info(
-        "api_register_in",
-        extra={
-            "request_id": rid,
-            "person_id": person_id,
-            "files_count": len(files),
-            "cap": cap,
-        },
-    )
-
-    for i, f in enumerate(files[:cap], start=1):
-        try:
-            raw = await _read_upload_capped(f, max_bytes)
-
-            if not raw:
-                errors += 1
-                log.warning("register_empty_file", extra={"request_id": rid, "idx": i})
-                continue
-
-            if len(raw) > max_bytes:
-                errors += 1
-                log.warning(
-                    "register_file_too_large",
-                    extra={"request_id": rid, "idx": i, "bytes": len(raw)},
-                )
-                continue
-
-            safe_name = (
-                os.path.basename(getattr(f, "filename", f"frame_{i:04d}.jpg"))
-                or f"frame_{i:04d}.jpg"
-            )
-
-            img = await run_in_threadpool(_decode_image, raw)
-            if img is None:
-                errors += 1
-                log.warning("register_decode_fail", extra={"request_id": rid, "idx": i})
-                continue
-
-            res = await run_in_threadpool(PIPE.enroll_image, img, person_id=person_id, source=safe_name)
-            faces = int(res.get("faces", 0))
-            embs = int(res.get("embeddings_added", 0))
-
-            total_faces += faces
-            total_emb += embs
-            processed += 1
-
-            if UPLOAD_TO_FIREBASE and firebase_initialized:
-                should_upload = (i <= 5) or (faces == 0) or (embs == 0)
-                if should_upload:
-                    debug_bytes = _encode_debug_jpg(img, max_w=640, quality=80)
-                    if debug_bytes:
-                        reason = "first5" if i <= 5 else ("noface" if faces == 0 else "noemb")
-                        debug_name = f"{reason}_{i:04d}_{safe_name}"
-                        debug_folder = f"users/{person_id}/debug_failed"
-                        threading.Thread(
-                            target=_bg_firebase_upload,
-                            args=(rid, debug_folder, debug_name, debug_bytes, "image/jpeg"),
-                            daemon=True,
-                        ).start()
-                        uploaded.append({"file": debug_name, "folder": debug_folder, "reason": reason})
-
-        except Exception as e:
-            errors += 1
-            log.exception("register_frame_error", extra={"request_id": rid, "idx": i, "error": str(e)})
-
-    summary = {
-        "ok": total_emb >= config.ENROLL_MIN_GOOD_EMBEDDINGS,
-        "request_id": rid,
-        "person_id": person_id,
-        "person_name": name,
-        "received_files": len(files),
-        "processed_files": processed,
-        "errors": errors,
-        "faces_detected": total_faces,
-        "embeddings_added": total_emb,
-        "uploaded_debug": uploaded,
-    }
-    log.info("api_register_out", extra={k: v for k, v in summary.items() if k != "person_name"})
-
-    if total_emb == 0:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "error",
-                "request_id": rid,
-                "message": "No valid images were enrolled.",
-                "details": summary,
-            },
-        )
-
-    if total_emb < config.ENROLL_MIN_GOOD_EMBEDDINGS:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "insufficient_enrollment",
-                "request_id": rid,
-                "embeddings_added": total_emb,
-                "message": (
-                    f"Only {total_emb} face embeddings captured. Need at least "
-                    f"{config.ENROLL_MIN_GOOD_EMBEDDINGS}. Ensure good lighting and hold face steady."
-                ),
-                "details": summary,
-            },
-        )
-
-    return summary
+    require_enroll_key(x_enroll_token, x_admin_token)
+    return await enroll_person(PIPE, firebase, request_id(request), user_id, name, files, max_images)
 
 
-# ───────────── Mark Attendance ─────────────
+# ───────────── Attendance ─────────────
 @app.post("/mark_attendance")
 async def mark_attendance(request: Request, file: UploadFile = File(...)):
-    from app.clients.http import post_json
-    from app import config
-
-    rid = _request_id(request)
-    max_bytes = getattr(config, "MAX_UPLOAD_BYTES", 5 * 1024 * 1024)
-
-    try:
-        raw = await _read_upload_capped(file, max_bytes)
-
-        if not raw:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "request_id": rid, "message": "Empty image upload"},
-            )
-        if len(raw) > max_bytes:
-            return JSONResponse(
-                status_code=413,
-                content={"status": "error", "request_id": rid, "message": "File too large"},
-            )
-
-        img = await run_in_threadpool(_decode_image, raw)
-        if img is None:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "request_id": rid, "message": "Invalid image"},
-            )
-
-        preds = await run_in_threadpool(PIPE.recognize_image, img)
-        if preds is None or len(preds) == 0:
-            return JSONResponse(
-                status_code=404,
-                content={"status": "no_face", "request_id": rid, "message": "No face detected."},
-            )
-
-        best = preds[0]
-        best_pid = str(best["prediction"]["person_id"])
-        best_sim = float(best["prediction"]["similarity"])
-
-        person_name = None
-        try:
-            if hasattr(PIPE, "db") and hasattr(PIPE.db, "get_person_name"):
-                person_name = PIPE.db.get_person_name(best_pid)
-        except Exception:
-            pass
-
-        if best_pid == "unknown":
-            log.info(
-                "recognition_confidence",
-                extra={
-                    "request_id": rid,
-                    "person_id": best_pid,
-                    "similarity": best_sim,
-                    "threshold": config.SIMILARITY_THRESHOLD,
-                    "outcome": "no_match",
-                },
-            )
-            return JSONResponse(
-                status_code=404,
-                content={
-                    "status": "no_match",
-                    "request_id": rid,
-                    "best": {
-                        "person_id": best_pid,
-                        "person_name": person_name,
-                        "similarity": best_sim,
-                    },
-                    "message": "Face not recognized. Attendance not marked.",
-                },
-            )
-
-        if not best_pid.isdigit():
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "status": "mapping_error",
-                    "request_id": rid,
-                    "best": {
-                        "person_id": best_pid,
-                        "person_name": person_name,
-                        "similarity": best_sim,
-                    },
-                    "message": "Recognized user id is not numeric. Attendance not marked.",
-                },
-            )
-
-        log.info(
-            "recognition_confidence",
-            extra={
-                "request_id": rid,
-                "person_id": best_pid,
-                "similarity": best_sim,
-                "threshold": config.SIMILARITY_THRESHOLD,
-                "outcome": "match",
-            },
-        )
-
-        erp_user_id = int(best_pid)
-        payload = {"user_id": erp_user_id}
-
-        try:
-            status, resp = await post_json(config.ERP_ATTENDANCE_URL, payload)
-            log.info(
-                "erp_attendance_sent",
-                extra={
-                    "request_id": rid,
-                    "person_id": best_pid,
-                    "erp_user_id": erp_user_id,
-                    "similarity": best_sim,
-                    "status": status,
-                },
-            )
-        except Exception as e:
-            log.exception("erp_attendance_http_failed", extra={"request_id": rid, "error": str(e)})
-            return JSONResponse(
-                status_code=502,
-                content={
-                    "status": "error",
-                    "request_id": rid,
-                    "best": {
-                        "person_id": best_pid,
-                        "person_name": person_name,
-                        "similarity": best_sim,
-                    },
-                    "message": "Face recognized but failed to mark attendance in ERP.",
-                },
-            )
-
-        if status not in (200, 201):
-            return JSONResponse(
-                status_code=502,
-                content={
-                    "status": "erp_error",
-                    "request_id": rid,
-                    "best": {
-                        "person_id": best_pid,
-                        "person_name": person_name,
-                        "similarity": best_sim,
-                    },
-                    "message": "Face recognized but ERP returned an error.",
-                },
-            )
-
-        msg = "Attendance marked successfully."
-        if isinstance(resp, dict) and resp.get("status") == "already_checked_in":
-            in_time = resp.get("attendance", {}).get("check_in_time_ist_text")
-            msg = f"Already checked in at {in_time}" if in_time else "Already checked in."
-
-        return {
-            "status": "marked",
-            "request_id": rid,
-            "user_id": erp_user_id,
-            "person_id": best_pid,
-            "person_name": person_name,
-            "similarity": best_sim,
-            "message": msg,
-        }
-
-    except Exception:
-        log.exception("mark_attendance_failed", extra={"request_id": rid})
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "request_id": rid, "message": "Internal server error"},
-        )
+    return await recognize_and_report(PIPE, request_id(request), file, CHECK_IN)
 
 
-# ───────────── Logout ─────────────
 @app.post("/logout")
 async def logout(request: Request, file: UploadFile = File(...)):
-    from app.clients.http import post_json
-    from app import config
-
-    rid = _request_id(request)
-    max_bytes = getattr(config, "MAX_UPLOAD_BYTES", 5 * 1024 * 1024)
-
-    try:
-        raw = await _read_upload_capped(file, max_bytes)
-
-        if not raw:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "request_id": rid, "message": "Empty image upload"},
-            )
-        if len(raw) > max_bytes:
-            return JSONResponse(
-                status_code=413,
-                content={"status": "error", "request_id": rid, "message": "File too large"},
-            )
-
-        img = await run_in_threadpool(_decode_image, raw)
-        if img is None:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "request_id": rid, "message": "Invalid image"},
-            )
-
-        preds = await run_in_threadpool(PIPE.recognize_image, img)
-        if preds is None or len(preds) == 0:
-            return JSONResponse(
-                status_code=404,
-                content={"status": "no_face", "request_id": rid, "message": "No face detected."},
-            )
-
-        best = preds[0]
-        best_pid = str(best["prediction"]["person_id"])
-        best_sim = float(best["prediction"]["similarity"])
-
-        person_name = None
-        try:
-            if hasattr(PIPE, "db") and hasattr(PIPE.db, "get_person_name"):
-                person_name = PIPE.db.get_person_name(best_pid)
-        except Exception:
-            pass
-
-        if best_pid == "unknown":
-            log.info(
-                "recognition_confidence",
-                extra={
-                    "request_id": rid,
-                    "person_id": best_pid,
-                    "similarity": best_sim,
-                    "threshold": config.SIMILARITY_THRESHOLD,
-                    "outcome": "no_match",
-                },
-            )
-            return JSONResponse(
-                status_code=404,
-                content={
-                    "status": "no_match",
-                    "request_id": rid,
-                    "best": {
-                        "person_id": best_pid,
-                        "person_name": person_name,
-                        "similarity": best_sim,
-                    },
-                    "message": "Face not recognized. Logout not marked.",
-                },
-            )
-
-        if not best_pid.isdigit():
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "status": "mapping_error",
-                    "request_id": rid,
-                    "best": {
-                        "person_id": best_pid,
-                        "person_name": person_name,
-                        "similarity": best_sim,
-                    },
-                    "message": "Recognized user id is not numeric. Logout not marked.",
-                },
-            )
-
-        log.info(
-            "recognition_confidence",
-            extra={
-                "request_id": rid,
-                "person_id": best_pid,
-                "similarity": best_sim,
-                "threshold": config.SIMILARITY_THRESHOLD,
-                "outcome": "match",
-            },
-        )
-
-        erp_user_id = int(best_pid)
-        payload = {"user_id": erp_user_id, "type": "OUT"}
-
-        try:
-            status, resp = await post_json(config.ERP_ATTENDANCE_URL, payload)
-            log.info(
-                "erp_logout_sent",
-                extra={
-                    "request_id": rid,
-                    "person_id": best_pid,
-                    "erp_user_id": erp_user_id,
-                    "similarity": best_sim,
-                    "status": status,
-                },
-            )
-        except Exception as e:
-            log.exception("erp_logout_http_failed", extra={"request_id": rid, "error": str(e)})
-            return JSONResponse(
-                status_code=502,
-                content={
-                    "status": "error",
-                    "request_id": rid,
-                    "best": {
-                        "person_id": best_pid,
-                        "person_name": person_name,
-                        "similarity": best_sim,
-                    },
-                    "message": "Face recognized but failed to mark logout in ERP.",
-                },
-            )
-
-        if status not in (200, 201):
-            return JSONResponse(
-                status_code=502,
-                content={
-                    "status": "erp_error",
-                    "request_id": rid,
-                    "best": {
-                        "person_id": best_pid,
-                        "person_name": person_name,
-                        "similarity": best_sim,
-                    },
-                    "message": "Face recognized but ERP returned an error.",
-                },
-            )
-
-        msg = "Logout marked successfully."
-        if isinstance(resp, dict) and resp.get("status") == "already_checked_out":
-            out_time = resp.get("attendance", {}).get("check_out_time_ist_text")
-            msg = f"Already logged out at {out_time}" if out_time else "Already logged out."
-
-        return {
-            "status": "logged_out",
-            "request_id": rid,
-            "user_id": erp_user_id,
-            "person_id": best_pid,
-            "person_name": person_name,
-            "similarity": best_sim,
-            "message": msg,
-        }
-
-    except Exception:
-        log.exception("logout_failed", extra={"request_id": rid})
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "request_id": rid, "message": "Internal server error"},
-        )
+    return await recognize_and_report(PIPE, request_id(request), file, CHECK_OUT)
 
 
 # ───────────── Admin ─────────────
 @app.get("/admin/people")
-def admin_people(
-    request: Request,
-    x_admin_token: Optional[str] = Header(default=None),
-):
-    rid = _request_id(request)
-    _require_admin(x_admin_token)
+def admin_people(request: Request, x_admin_token: Optional[str] = Header(default=None)):
+    rid = request_id(request)
+    require_admin(x_admin_token)
     with admin_lock:
-        people = _people_dump()
+        people = admin_service.people_dump(PIPE)
     return {
         "ok": True,
         "request_id": rid,
@@ -850,54 +165,37 @@ def admin_people(
 
 
 @app.delete("/admin/person/{person_id}")
-def admin_delete_person(
-    person_id: str,
-    request: Request,
-    x_admin_token: Optional[str] = Header(default=None),
-):
-    rid = _request_id(request)
-    _require_admin(x_admin_token)
+def admin_delete_person(person_id: str, request: Request, x_admin_token: Optional[str] = Header(default=None)):
+    rid = request_id(request)
+    require_admin(x_admin_token)
     pid = str(person_id).strip()
     if not pid:
         raise HTTPException(status_code=400, detail="person_id required")
     with admin_lock:
-        result = _try_remove_person(pid)
+        result = admin_service.remove_person(PIPE, pid)
     log.warning("admin_person_deleted", extra={"request_id": rid, "person_id": pid, "result": result})
     return {"ok": True, "request_id": rid, "person_id": pid, "result": result}
 
 
-# ───────────── Firebase Debug ─────────────
+# ───────────── Firebase debug (admin only) ─────────────
 @app.post("/debug/firebase_test")
 async def firebase_test(
     request: Request,
     user_id: str = Form(...),
     x_admin_token: Optional[str] = Header(default=None),
 ):
-    rid = _request_id(request)
-    _require_admin(x_admin_token)
+    rid = request_id(request)
+    require_admin(x_admin_token)
     try:
-        init_firebase_once()
+        firebase.init_once()
         payload = f"hello from server at {int(time.time())}\n".encode()
         gs_url, public_url = await run_in_threadpool(
-            firebase_upload_bytes,
-            f"users/{str(user_id).strip()}/debug",
-            "ping.txt",
-            payload,
-            "text/plain",
+            firebase.upload_bytes, f"users/{str(user_id).strip()}/debug", "ping.txt", payload, "text/plain"
         )
-        return {
-            "ok": True,
-            "request_id": rid,
-            "gs_url": gs_url,
-            "public_url": public_url,
-            "bucket": firebase_bucket.name,
-        }
+        return {"ok": True, "request_id": rid, "gs_url": gs_url, "public_url": public_url, "bucket": firebase.bucket.name}
     except Exception:
         log.exception("firebase_test_failed", extra={"request_id": rid})
-        return JSONResponse(
-            status_code=500,
-            content={"ok": False, "request_id": rid, "error": "firebase_test_failed"},
-        )
+        return JSONResponse(status_code=500, content={"ok": False, "request_id": rid, "error": "firebase_test_failed"})
 
 
 # ───────────── Root ─────────────
@@ -905,6 +203,6 @@ async def firebase_test(
 def root(request: Request):
     return {
         "message": "Attendance Face API",
-        "request_id": _request_id(request),
+        "request_id": request_id(request),
         "try": ["/healthz", "POST /register", "POST /mark_attendance"],
     }

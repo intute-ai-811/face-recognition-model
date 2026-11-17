@@ -83,12 +83,13 @@ async def test_register_key_enabled_without_tokens_is_503(server_module, img, mo
     assert r.status_code == 503
 
 
-def test_token_compare_is_constant_time_helper(server_module):
-    assert server_module._token_matches("abc", "abc")
-    assert not server_module._token_matches("abc", "abd")
-    assert not server_module._token_matches(None, "abc")
-    assert not server_module._token_matches("abc", None)
-    assert not server_module._token_matches("", "")
+def test_token_compare_is_constant_time_helper():
+    from app.api.security import token_matches
+    assert token_matches("abc", "abc")
+    assert not token_matches("abc", "abd")
+    assert not token_matches(None, "abc")
+    assert not token_matches("abc", None)
+    assert not token_matches("", "")
 
 
 # ── debug endpoint ───────────────────────────────────────────────────────────
@@ -112,7 +113,9 @@ async def test_debug_firebase_disabled_without_admin_token(server_module, monkey
 
 # ── firebase objects stay private ────────────────────────────────────────────
 
-def test_firebase_upload_never_makes_objects_public(server_module, monkeypatch):
+def test_firebase_upload_never_makes_objects_public(monkeypatch):
+    from app.infrastructure.firebase import FirebaseClient
+
     class Blob:
         public_calls = 0
 
@@ -128,9 +131,9 @@ def test_firebase_upload_never_makes_objects_public(server_module, monkeypatch):
         def blob(self, path):
             return Blob()
 
-    monkeypatch.setattr(server_module, "init_firebase_once", lambda: None)
-    monkeypatch.setattr(server_module, "firebase_bucket", Bucket())
-    gs_url, public_url = server_module.firebase_upload_bytes("users/70/debug", "a.jpg", b"x")
+    fb = FirebaseClient(enabled=True)
+    fb.initialized, fb.bucket = True, Bucket()
+    gs_url, public_url = fb.upload_bytes("users/70/debug", "a.jpg", b"x")
     assert gs_url == "gs://bucket/users/70/debug/a.jpg"
     assert public_url == ""
     assert Blob.public_calls == 0
@@ -149,7 +152,8 @@ async def test_request_over_content_length_cap_is_413(server_module, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_oversized_file_reads_only_cap_plus_one(server_module, monkeypatch):
+async def test_oversized_file_reads_only_cap_plus_one():
+    from app.api.uploads import read_upload_capped
     seen = []
 
     class FakeUpload:
@@ -160,7 +164,7 @@ async def test_oversized_file_reads_only_cap_plus_one(server_module, monkeypatch
         async def close(self):
             pass
 
-    raw = await server_module._read_upload_capped(FakeUpload(), 4)
+    raw = await read_upload_capped(FakeUpload(), 4)
     assert seen == [5]
     assert len(raw) == 5  # > cap, so callers return 413 as before
 
@@ -171,15 +175,17 @@ def _png(h, w):
     return buf.tobytes()
 
 
-def test_decode_rejects_images_over_pixel_cap(server_module, monkeypatch, config_module):
+def test_decode_rejects_images_over_pixel_cap(monkeypatch, config_module):
+    from app.api.uploads import decode_image
     monkeypatch.setattr(config_module, "MAX_IMAGE_PIXELS", 10_000, raising=False)
-    assert server_module._decode_image(_png(200, 200)) is None   # 40k px
-    img = server_module._decode_image(_png(50, 50))              # 2.5k px
+    assert decode_image(_png(200, 200)) is None   # 40k px
+    img = decode_image(_png(50, 50))              # 2.5k px
     assert img is not None and img.shape == (50, 50, 3)
 
 
-def test_decode_invalid_bytes_returns_none(server_module):
-    assert server_module._decode_image(b"not an image") is None
+def test_decode_invalid_bytes_returns_none():
+    from app.api.uploads import decode_image
+    assert decode_image(b"not an image") is None
 
 
 @pytest.mark.asyncio
