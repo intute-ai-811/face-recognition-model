@@ -1,0 +1,134 @@
+{
+ "env": {
+  "python": "3.13.18",
+  "onnxruntime": "1.32.0",
+  "numpy": "2.5.5",
+  "cpu": "x86_64",
+  "cpu_count": 22
+ },
+ "stages": {
+  "model_load_s": 0.11,
+  "rss_after_load_mb": 259.5,
+  "rss_model_delta_mb": 87.2,
+  "images": {
+   "rhythm1.jpeg": {
+    "shape": [
+     1280,
+     959,
+     3
+    ],
+    "faces": 1,
+    "detect": {
+     "n": 20,
+     "p50_ms": 23.4,
+     "p95_ms": 40.09,
+     "p99_ms": 40.93,
+     "mean_ms": 27.37
+    },
+    "align": {
+     "n": 20,
+     "p50_ms": 0.05,
+     "p95_ms": 0.05,
+     "p99_ms": 0.05,
+     "mean_ms": 0.05
+    },
+    "embed": {
+     "n": 20,
+     "p50_ms": 11.96,
+     "p95_ms": 15.08,
+     "p99_ms": 15.08,
+     "mean_ms": 12.02
+    },
+    "recognize_total": {
+     "n": 20,
+     "p50_ms": 41.72,
+     "p95_ms": 64.69,
+     "p99_ms": 68.38,
+     "mean_ms": 43.95
+    }
+   },
+   "test.jpg": {
+    "shape": [
+     1600,
+     900,
+     3
+    ],
+    "faces": 1,
+    "detect": {
+     "n": 20,
+     "p50_ms": 27.36,
+     "p95_ms": 33.94,
+     "p99_ms": 36.22,
+     "mean_ms": 26.31
+    },
+    "align": {
+     "n": 20,
+     "p50_ms": 0.03,
+     "p95_ms": 0.04,
+     "p99_ms": 0.04,
+     "mean_ms": 0.03
+    },
+    "embed": {
+     "n": 20,
+     "p50_ms": 10.73,
+     "p95_ms": 15.89,
+     "p99_ms": 17.77,
+     "mean_ms": 10.71
+    },
+    "recognize_total": {
+     "n": 20,
+     "p50_ms": 44.0,
+     "p95_ms": 63.51,
+     "p99_ms": 73.87,
+     "mean_ms": 47.2
+    }
+   }
+  }
+ },
+ "matching": {
+  "100": {
+   "templates": 1000,
+   "search": {
+    "n": 50,
+    "p50_ms": 0.14,
+    "p95_ms": 0.19,
+    "p99_ms": 0.24,
+    "mean_ms": 0.14
+   },
+   "index_rss_delta_mb": 0.3
+  },
+  "1000": {
+   "templates": 10000,
+   "search": {
+    "n": 50,
+    "p50_ms": 1.44,
+    "p95_ms": 3.49,
+    "p99_ms": 6.09,
+    "mean_ms": 1.72
+   },
+   "index_rss_delta_mb": 17.7
+  },
+  "10000": {
+   "templates": 100000,
+   "search": {
+    "n": 20,
+    "p50_ms": 17.23,
+    "p95_ms": 17.79,
+    "p99_ms": 17.97,
+    "mean_ms": 16.98
+   },
+   "index_rss_delta_mb": 217.9
+  },
+  "100000": {
+   "templates": 1000000,
+   "search": {
+    "n": 3,
+    "p50_ms": 178.4,
+    "p95_ms": 180.22,
+    "p99_ms": 180.38,
+    "mean_ms": 179.07
+   },
+   "index_rss_delta_mb": 2291.0
+  }
+ }
+}
