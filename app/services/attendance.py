@@ -8,6 +8,7 @@ tests/test_api_contract.py).
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 from fastapi import UploadFile
@@ -17,12 +18,14 @@ from starlette.concurrency import run_in_threadpool
 from app import config
 from app.api.uploads import decode_image, read_upload_capped
 from app.clients import http as erp_http
+from app.observability import metrics
 
 log = logging.getLogger("app.api.server")
 
 
 @dataclass(frozen=True)
 class AttendanceAction:
+    metric: str               # "check_in" / "check_out" - metrics label
     verb: str                 # "Attendance" / "Logout" - used in messages
     erp_extra: dict           # merged into the ERP payload next to user_id
     sent_event: str           # log event after the ERP call
@@ -37,6 +40,7 @@ class AttendanceAction:
 
 
 CHECK_IN = AttendanceAction(
+    metric="check_in",
     verb="Attendance",
     erp_extra={},
     sent_event="erp_attendance_sent",
@@ -51,6 +55,7 @@ CHECK_IN = AttendanceAction(
 )
 
 CHECK_OUT = AttendanceAction(
+    metric="check_out",
     verb="Logout",
     erp_extra={"type": "OUT"},
     sent_event="erp_logout_sent",
@@ -77,19 +82,27 @@ async def recognize_and_report(pipe, rid: str, file: UploadFile, action: Attenda
     max_bytes = getattr(config, "MAX_UPLOAD_BYTES", 5 * 1024 * 1024)
     verb_lower = action.verb.lower()
 
+    def outcome(name: str):
+        metrics.ATTENDANCE_OUTCOMES.labels(action.metric, name).inc()
+
     try:
         raw = await read_upload_capped(file, max_bytes)
         if not raw:
+            outcome("invalid_upload")
             return _error(400, rid, "error", "Empty image upload")
         if len(raw) > max_bytes:
+            outcome("invalid_upload")
             return _error(413, rid, "error", "File too large")
 
         img = await run_in_threadpool(decode_image, raw)
         if img is None:
+            outcome("invalid_upload")
             return _error(400, rid, "error", "Invalid image")
 
-        preds = await run_in_threadpool(pipe.recognize_image, img)
+        with metrics.PIPELINE_STAGE_SECONDS.labels("recognize").time():
+            preds = await run_in_threadpool(pipe.recognize_image, img)
         if preds is None or len(preds) == 0:
+            outcome("no_face")
             return _error(404, rid, "no_face", "No face detected.")
 
         best = preds[0]
@@ -115,9 +128,11 @@ async def recognize_and_report(pipe, rid: str, file: UploadFile, action: Attenda
 
         if best_pid == "unknown":
             confidence_log("no_match")
+            outcome("no_match")
             return _error(404, rid, "no_match", f"Face not recognized. {action.verb} not marked.", best_info)
 
         if not best_pid.isdigit():
+            outcome("mapping_error")
             return _error(
                 409, rid, "mapping_error",
                 f"Recognized user id is not numeric. {action.verb} not marked.", best_info,
@@ -127,8 +142,10 @@ async def recognize_and_report(pipe, rid: str, file: UploadFile, action: Attenda
         erp_user_id = int(best_pid)
         payload = {"user_id": erp_user_id, **action.erp_extra}
 
+        erp_start = time.perf_counter()
         try:
             status, resp = await erp_http.post_json(config.ERP_ATTENDANCE_URL, payload)
+            metrics.ERP_REQUEST_SECONDS.labels(action.metric).observe(time.perf_counter() - erp_start)
             log.info(
                 action.sent_event,
                 extra={
@@ -138,9 +155,13 @@ async def recognize_and_report(pipe, rid: str, file: UploadFile, action: Attenda
             )
         except Exception as e:
             log.exception(action.failed_event, extra={"request_id": rid, "error": str(e)})
+            metrics.ERP_FAILURES.labels(action.metric, "exception").inc()
+            outcome("erp_exception")
             return _error(502, rid, "error", f"Face recognized but failed to mark {verb_lower} in ERP.", best_info)
 
         if status not in (200, 201):
+            metrics.ERP_FAILURES.labels(action.metric, "status").inc()
+            outcome("erp_error")
             return _error(502, rid, "erp_error", "Face recognized but ERP returned an error.", best_info)
 
         msg = action.ok_message
@@ -148,6 +169,7 @@ async def recognize_and_report(pipe, rid: str, file: UploadFile, action: Attenda
             earlier = resp.get("attendance", {}).get(action.already_time_key)
             msg = action.already_message.format(time=earlier) if earlier else action.already_message_no_time
 
+        outcome("already" if msg != action.ok_message else action.ok_status)
         return {
             "status": action.ok_status,
             "request_id": rid,
@@ -159,6 +181,7 @@ async def recognize_and_report(pipe, rid: str, file: UploadFile, action: Attenda
         }
 
     except Exception:
+        outcome("error")
         log.exception(action.crash_event, extra={"request_id": rid})
         return JSONResponse(
             status_code=500,

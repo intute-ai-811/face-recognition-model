@@ -246,6 +246,11 @@ class SqliteStore:
     def search_cosine(self, q: np.ndarray, top_k: int) -> list[list[dict]]:
         return search_snapshot(self._snapshot, q, top_k, self.emb_dim)
 
+    def stats(self) -> dict[str, int]:
+        """Counts for metrics/readiness, without logging (called on every scrape)."""
+        ids = self._snapshot.person_ids
+        return {"embeddings": len(ids), "people": len(set(ids))}
+
     def people(self) -> dict[str, int]:
         return snapshot_counts(self._snapshot)
 

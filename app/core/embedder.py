@@ -18,6 +18,7 @@ import numpy as np
 from app import config
 from app.core.ort_session import create_session
 from app.logging_config import get_logger, timed
+from app.observability.metrics import PIPELINE_STAGE_SECONDS
 
 log = get_logger(__name__)
 
@@ -57,7 +58,7 @@ class FaceEmbedder:
         n = len(aligned_faces)
         if n == 0:
             return np.zeros((0, config.EMB_DIM), np.float32)
-        with timed(log, "embed_infer", faces=n):
+        with timed(log, "embed_infer", faces=n), PIPELINE_STAGE_SECONDS.labels("embed").time():
             feats = []
             for img in aligned_faces:
                 if img.shape[:2] != (config.ALIGNED_SIZE, config.ALIGNED_SIZE):

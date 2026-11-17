@@ -14,6 +14,7 @@ dependencies = [
     "aiohttp>=3.14.4",
     "firebase-admin>=7.1",
     "pillow>=13.0",
+    "prometheus-client>=0.23",
 ]
 
 [dependency-groups]

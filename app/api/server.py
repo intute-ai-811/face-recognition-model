@@ -18,16 +18,17 @@ from typing import Optional
 import cv2  # noqa: F401  (re-exported: tests patch server.cv2.imdecode)
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 
 from app import config as app_config
-from app.api.security import require_admin, require_enroll_key
+from app.api.security import require_admin, require_enroll_key, token_matches
 from app.api.uploads import request_id
 from app.core.recognize import Pipeline
 from app.infrastructure.firebase import FirebaseClient
 from app.logging_config import setup_logging
+from app.observability import metrics
 from app.services import admin as admin_service
 from app.services.attendance import CHECK_IN, CHECK_OUT, recognize_and_report
 from app.services.enrollment import enroll_person
@@ -39,6 +40,18 @@ log = logging.getLogger(__name__)
 PIPE = Pipeline()
 firebase = FirebaseClient()
 admin_lock = threading.Lock()
+
+
+def _store_stat(key: str) -> float:
+    stats = getattr(getattr(PIPE, "db", None), "stats", None)
+    try:
+        return float(stats()[key]) if stats else float("nan")
+    except Exception:
+        return float("nan")
+
+
+metrics.STORE_EMBEDDINGS.set_function(lambda: _store_stat("embeddings"))
+metrics.STORE_PEOPLE.set_function(lambda: _store_stat("people"))
 
 
 @asynccontextmanager
@@ -61,6 +74,21 @@ async def request_size_limit(request: Request, call_next):
             content={"status": "error", "request_id": request_id(request), "message": "Request too large"},
         )
     return await call_next(request)
+
+
+@app.middleware("http")
+async def http_metrics(request: Request, call_next):
+    start = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        # Route template (e.g. /admin/person/{person_id}), never the raw path, so no IDs end up in labels.
+        route = getattr(request.scope.get("route"), "path", None) or "unmatched"
+        metrics.HTTP_REQUESTS.labels(request.method, route, str(status)).inc()
+        metrics.HTTP_LATENCY.labels(route).observe(time.perf_counter() - start)
 
 
 @app.middleware("http")
@@ -121,6 +149,39 @@ def healthz(request: Request):
         }
         resp["people"] = PIPE.db.people()
     return resp
+
+
+@app.get("/readyz")
+def readyz(request: Request):
+    """
+    Ready = the enrollment store answers. (Models load at import; the process cannot
+    start without them.) /healthz stays a plain liveness check with an unchanged response.
+    """
+    checks = {"store": False, "embeddings": None}
+    try:
+        db = PIPE.db
+        stats = getattr(db, "stats", None)
+        checks["embeddings"] = stats()["embeddings"] if stats else sum(dict(db.people()).values())
+        checks["store"] = True
+    except Exception as e:
+        log.warning("readyz_failed", extra={"error": repr(e)})
+    ready = checks["store"]
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"status": "ready" if ready else "not_ready", "request_id": request_id(request), "checks": checks},
+    )
+
+
+@app.get("/metrics")
+def metrics_endpoint(authorization: Optional[str] = Header(default=None)):
+    """Prometheus metrics. If METRICS_TOKEN is set, requires 'Authorization: Bearer <token>'."""
+    expected = os.getenv("METRICS_TOKEN")
+    if expected:
+        given = authorization[7:] if authorization and authorization.startswith("Bearer ") else None
+        if not token_matches(given, expected):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    body, content_type = metrics.render()
+    return Response(content=body, media_type=content_type)
 
 
 # ───────────── Enrollment ─────────────

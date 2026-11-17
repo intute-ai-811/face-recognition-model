@@ -371,6 +371,11 @@ class LocalStore:
         # Read the snapshot reference exactly once so matrix rows and ids always belong together.
         return search_snapshot(self._snapshot, q, top_k, self.emb_dim)
 
+    def stats(self) -> dict[str, int]:
+        """Counts for metrics/readiness, without logging (called on every scrape)."""
+        ids = self._snapshot.person_ids
+        return {"embeddings": len(ids), "people": len(set(ids))}
+
     def people(self) -> dict[str, int]:
         counts = snapshot_counts(self._snapshot)
         log.info("people_summary", extra={"unique_people": len(counts)})
