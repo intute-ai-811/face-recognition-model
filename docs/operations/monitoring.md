@@ -19,7 +19,8 @@ The API exposes Prometheus metrics, a readiness check and optional JSON logs. No
 | `face_api_attendance_outcomes_total` | action (`check_in`/`check_out`), outcome | `marked`, `logged_out`, `already`, `no_match`, `no_face`, `mapping_error`, `invalid_upload`, `erp_error`, `erp_exception`, `error` |
 | `face_api_pipeline_stage_seconds` | stage (`detect`/`embed`/`recognize`) | Inference time |
 | `face_api_erp_request_seconds` | action | ERP call latency |
-| `face_api_erp_failures_total` | action, kind (`exception`/`status`) | ERP calls that failed |
+| `face_api_erp_failures_total` | action, kind (`exception`/`status`) | ERP calls that failed (after any retry) |
+| `face_api_erp_retries_total` | action, reason (`connect`/`status_5xx`) | ERP calls retried after a transient failure (see below) |
 | `face_api_enrollment_outcomes_total` | outcome | `enrolled`, `insufficient`, `no_valid_images`, `rejected` |
 | `face_api_enrollment_images_total` | result | Per-image enrollment results |
 | `face_api_store_embeddings`, `face_api_store_people` | none | Enrolled templates and people for the active model |
@@ -55,3 +56,19 @@ Alert rules (`deploy/monitoring/alerts.yml`):
 ## JSON logs
 
 Set `LOG_FORMAT=json` in `app.env` for one JSON object per line, which suits log shippers (Loki, Elastic). The default stays the existing `key=value` format.
+
+## ERP retry
+
+When the ERP is unreachable (connection refused/reset, DNS) or answers 502/503/504, the
+service retries once after 0.5 s before giving the kiosk the usual 502. Timeouts are
+not retried, so the kiosk never waits for two 8 s timeouts. A retry is safe because the
+ERP answers a duplicate with `already_checked_in` / `already_checked_out`; in that case
+the kiosk sees "Already checked in at <time>" instead of "Attendance marked successfully."
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `ERP_RETRIES` | `1` | Extra attempts; `0` restores the previous behaviour |
+| `ERP_RETRY_BACKOFF_S` | `0.5` | Wait before attempt *n* is `n × backoff` |
+
+A steady rise in `face_api_erp_retries_total` with few `face_api_erp_failures_total`
+means the ERP is flaky but the retry is absorbing it.

@@ -1,6 +1,7 @@
 # app/clients/http.py
+import asyncio
+
 import aiohttp
-import logging
 from app.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -26,4 +27,13 @@ async def post_json(url: str, payload: dict, timeout: int = 8):
                 return resp.status, data
     except Exception as e:
         log.exception("http_post_failed", extra={"url": url, "error": str(e)})
-        return None, {"error": str(e)}
+        return None, {"error": str(e), "error_kind": error_kind(e)}
+
+
+def error_kind(e: BaseException) -> str:
+    """'timeout' (ERP may still be processing), 'connect' (request likely never handled) or 'other'."""
+    if isinstance(e, (asyncio.TimeoutError, aiohttp.ServerTimeoutError)):
+        return "timeout"
+    if isinstance(e, aiohttp.ClientConnectionError):
+        return "connect"
+    return "other"
