@@ -1,18 +1,11 @@
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.log
-*.sqlite3
-.env
-.venv
-venv/
-*.egg-info
-.dist/
-.build/
-.cache/
-.git
-.gitignore
-dockerignore
-serviceAccount.json
-firebase_service.json
+# Allow-list build context: only what the image needs.
+# Biometric samples (*.jpeg, test.jpg), data/, models/, credentials, tests and
+# docs never enter the image. Models, data and credentials are mounted at runtime.
+*
+!app
+!requirements.txt
+
+# Never ship caches, even from inside app/
+**/__pycache__
+**/*.pyc
+**/*.pyo

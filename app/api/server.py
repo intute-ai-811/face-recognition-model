@@ -7,6 +7,7 @@ import os
 import json
 import io
 import uuid
+import hmac
 from typing import Optional, Tuple
 import threading
 import pickle
@@ -16,18 +17,76 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.requests import Request
 from starlette.concurrency import run_in_threadpool
+from app import config as app_config
 from app.logging_config import setup_logging
 from app.core.recognize import Pipeline
 
 admin_lock = threading.Lock()
 
 
+def _token_matches(given: Optional[str], expected: Optional[str]) -> bool:
+    if not given or not expected:
+        return False
+    return hmac.compare_digest(given.encode(), expected.encode())
+
+
 def _require_admin(x_admin_token: Optional[str]) -> None:
     expected = os.getenv("ADMIN_TOKEN")
     if not expected:
         raise HTTPException(status_code=503, detail="Admin endpoints disabled (ADMIN_TOKEN not set).")
-    if not x_admin_token or x_admin_token != expected:
+    if not _token_matches(x_admin_token, expected):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _require_enroll_key(x_enroll_token: Optional[str], x_admin_token: Optional[str]) -> None:
+    """
+    Enrollment authentication, off by default (ENROLL_REQUIRE_KEY=0) so existing
+    kiosk clients keep working. When enabled, /register needs X-Enroll-Token
+    matching ENROLL_TOKEN, or X-Admin-Token matching ADMIN_TOKEN.
+    """
+    if os.getenv("ENROLL_REQUIRE_KEY", "0") != "1":
+        return
+    enroll_token = os.getenv("ENROLL_TOKEN")
+    admin_token = os.getenv("ADMIN_TOKEN")
+    if not enroll_token and not admin_token:
+        raise HTTPException(
+            status_code=503,
+            detail="Enrollment disabled (ENROLL_REQUIRE_KEY=1 but no ENROLL_TOKEN/ADMIN_TOKEN set).",
+        )
+    if _token_matches(x_enroll_token, enroll_token) or _token_matches(x_admin_token, admin_token):
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def _read_upload_capped(f: UploadFile, max_bytes: int) -> bytes:
+    """Read at most max_bytes + 1 bytes, so an oversized file is detected without loading it whole."""
+    try:
+        return await f.read(max_bytes + 1)
+    finally:
+        await f.close()
+
+
+def _decode_image(raw: bytes):
+    """
+    Decode with a pixel cap. The header is read first (cheap) so a small file that
+    expands to a huge image is rejected before allocation. Returns None on failure,
+    which callers already map to their existing "invalid image" responses.
+    """
+    max_pixels = getattr(app_config, "MAX_IMAGE_PIXELS", 50_000_000)
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(raw)) as im:
+            w, h = im.size
+        if w * h > max_pixels:
+            logging.getLogger(__name__).warning("image_too_many_pixels", extra={"w": w, "h": h})
+            return None
+    except Exception:
+        pass  # Not a format Pillow knows; OpenCV decides, then the post-decode check applies.
+    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if img is not None and img.shape[0] * img.shape[1] > max_pixels:
+        logging.getLogger(__name__).warning("image_too_many_pixels", extra={"w": img.shape[1], "h": img.shape[0]})
+        return None
+    return img
 
 
 def _people_dump() -> dict:
@@ -149,11 +208,9 @@ def firebase_upload_bytes(
     blob_path = f"{folder_path.rstrip('/')}/{os.path.basename(filename)}"
     blob = firebase_bucket.blob(blob_path)
     blob.upload_from_file(io.BytesIO(data), content_type=content_type)
-    try:
-        blob.make_public()
-        public_url = blob.public_url
-    except Exception:
-        public_url = ""
+    # Objects stay private: these are employee face images. public_url is kept
+    # (empty) for response compatibility.
+    public_url = ""
     gs_url = f"gs://{firebase_bucket.name}/{blob_path}"
     return gs_url, public_url
 
@@ -174,6 +231,18 @@ def _startup_init_firebase():
 
 
 # ───────────── Middleware ─────────────
+@app.middleware("http")
+async def request_size_limit(request: Request, call_next):
+    limit = getattr(app_config, "MAX_REQUEST_BYTES", None)
+    length = request.headers.get("content-length")
+    if limit and length and length.isdigit() and int(length) > limit:
+        return JSONResponse(
+            status_code=413,
+            content={"status": "error", "request_id": _request_id(request), "message": "Request too large"},
+        )
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def http_logger(request: Request, call_next):
     start = time.perf_counter()
@@ -271,9 +340,12 @@ async def register(
     user_id: str = Form(...),
     files: list[UploadFile] = File(...),
     max_images: int = Query(35, ge=1, le=200),
+    x_enroll_token: Optional[str] = Header(default=None),
+    x_admin_token: Optional[str] = Header(default=None),
 ):
     from app import config
 
+    _require_enroll_key(x_enroll_token, x_admin_token)
     rid = _request_id(request)
     person_id = str(user_id).strip()
 
@@ -320,7 +392,6 @@ async def register(
         extra={
             "request_id": rid,
             "person_id": person_id,
-            "person_name": name,
             "files_count": len(files),
             "cap": cap,
         },
@@ -328,10 +399,7 @@ async def register(
 
     for i, f in enumerate(files[:cap], start=1):
         try:
-            try:
-                raw = await f.read()
-            finally:
-                await f.close()
+            raw = await _read_upload_capped(f, max_bytes)
 
             if not raw:
                 errors += 1
@@ -351,8 +419,7 @@ async def register(
                 or f"frame_{i:04d}.jpg"
             )
 
-            arr = np.frombuffer(raw, np.uint8)
-            img = await run_in_threadpool(cv2.imdecode, arr, cv2.IMREAD_COLOR)
+            img = await run_in_threadpool(_decode_image, raw)
             if img is None:
                 errors += 1
                 log.warning("register_decode_fail", extra={"request_id": rid, "idx": i})
@@ -397,7 +464,7 @@ async def register(
         "embeddings_added": total_emb,
         "uploaded_debug": uploaded,
     }
-    log.info("api_register_out", extra=summary)
+    log.info("api_register_out", extra={k: v for k, v in summary.items() if k != "person_name"})
 
     if total_emb == 0:
         return JSONResponse(
@@ -438,10 +505,7 @@ async def mark_attendance(request: Request, file: UploadFile = File(...)):
     max_bytes = getattr(config, "MAX_UPLOAD_BYTES", 5 * 1024 * 1024)
 
     try:
-        try:
-            raw = await file.read()
-        finally:
-            await file.close()
+        raw = await _read_upload_capped(file, max_bytes)
 
         if not raw:
             return JSONResponse(
@@ -454,8 +518,7 @@ async def mark_attendance(request: Request, file: UploadFile = File(...)):
                 content={"status": "error", "request_id": rid, "message": "File too large"},
             )
 
-        arr = np.frombuffer(raw, np.uint8)
-        img = await run_in_threadpool(cv2.imdecode, arr, cv2.IMREAD_COLOR)
+        img = await run_in_threadpool(_decode_image, raw)
         if img is None:
             return JSONResponse(
                 status_code=400,
@@ -610,10 +673,7 @@ async def logout(request: Request, file: UploadFile = File(...)):
     max_bytes = getattr(config, "MAX_UPLOAD_BYTES", 5 * 1024 * 1024)
 
     try:
-        try:
-            raw = await file.read()
-        finally:
-            await file.close()
+        raw = await _read_upload_capped(file, max_bytes)
 
         if not raw:
             return JSONResponse(
@@ -626,8 +686,7 @@ async def logout(request: Request, file: UploadFile = File(...)):
                 content={"status": "error", "request_id": rid, "message": "File too large"},
             )
 
-        arr = np.frombuffer(raw, np.uint8)
-        img = await run_in_threadpool(cv2.imdecode, arr, cv2.IMREAD_COLOR)
+        img = await run_in_threadpool(_decode_image, raw)
         if img is None:
             return JSONResponse(
                 status_code=400,
@@ -809,8 +868,13 @@ def admin_delete_person(
 
 # ───────────── Firebase Debug ─────────────
 @app.post("/debug/firebase_test")
-async def firebase_test(request: Request, user_id: str = Form(...)):
+async def firebase_test(
+    request: Request,
+    user_id: str = Form(...),
+    x_admin_token: Optional[str] = Header(default=None),
+):
     rid = _request_id(request)
+    _require_admin(x_admin_token)
     try:
         init_firebase_once()
         payload = f"hello from server at {int(time.time())}\n".encode()

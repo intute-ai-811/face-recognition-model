@@ -14,9 +14,14 @@ async def post_json(url: str, payload: dict, timeout: int = 8):
                     data = await resp.json()
                 except Exception:
                     data = {"raw": text}
+                # Log status and response keys only; ERP bodies can contain personal data.
                 log.info(
                     "http_post",
-                    extra={"url": url, "status": resp.status, "response": data},
+                    extra={
+                        "url": url,
+                        "status": resp.status,
+                        "response_keys": sorted(data) if isinstance(data, dict) else type(data).__name__,
+                    },
                 )
                 return resp.status, data
     except Exception as e:
