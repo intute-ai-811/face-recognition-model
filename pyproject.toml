@@ -1,0 +1,31 @@
+[project]
+name = "face-recognition-attendance"
+version = "0.4.0"
+description = "Face recognition attendance API (SCRFD + MobileFaceNet on ONNX Runtime)"
+requires-python = ">=3.13,<3.14"
+# Direct runtime dependencies only; transitive versions are pinned in uv.lock.
+dependencies = [
+    "fastapi>=0.163.1",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.31",
+    "numpy>=2.1,<3",
+    "opencv-python-headless>=4.12,<5",
+    "onnxruntime>=1.32,<2",
+    # Used at runtime for SCRFD/ArcFace wrappers until PR 6 replaces them.
+    "insightface==0.7.3",
+    "aiohttp>=3.14.4",
+    "firebase-admin>=7.1",
+    "pillow>=13.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2",
+    "pytest-asyncio>=1.5",
+    "httpx>=0.28.1",
+    "ruff>=0.17.5",
+    "pip-audit>=2.9",
+]
+
+[tool.uv]
+package = false

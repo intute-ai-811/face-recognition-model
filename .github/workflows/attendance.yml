@@ -1,5 +1,7 @@
 name: Build, Push & Deploy to VPS
 
+# Manual only. Deploys the image built from this exact commit (sha-<commit> tag),
+# and restores the previous image automatically if the new one fails its health check.
 on:
   workflow_dispatch:
 
@@ -35,7 +37,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
-            type=sha
+            type=sha,format=long
 
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -58,14 +60,18 @@ jobs:
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USERNAME }}
+          # Key auth preferred; password kept as fallback until VPS_SSH_KEY is set up,
+          # after which VPS_PASSWORD can be deleted.
+          key: ${{ secrets.VPS_SSH_KEY }}
           password: ${{ secrets.VPS_PASSWORD }}
           port: 22
           script_stop: true
-          envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,REGISTRY,IMAGE_NAME
+          envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,REGISTRY,IMAGE_NAME,GIT_SHA
           script: |
             set -eo pipefail
 
-            IMAGE="${REGISTRY}/${IMAGE_NAME}:latest"
+            IMAGE_REPO="${REGISTRY}/${IMAGE_NAME}"
+            IMAGE="${IMAGE_REPO}:sha-${GIT_SHA}"
             CONTAINER_NAME="face-recognition-api"
             APP_DIR="$HOME/face-recognition-model"
             ENV_FILE="$APP_DIR/app.env"
@@ -75,10 +81,22 @@ jobs:
                      "$APP_DIR/models/scrfd_2.5g_bnkps.onnx" \
                      "$APP_DIR/models/w600k_mbf.onnx" "$APP_DIR/data"; do
               if [ ! -e "$p" ]; then
-                echo "ERROR: missing $p on VPS - aborting, existing container left running."
+                echo "ERROR: missing $p on VPS - aborting; existing container left running."
                 exit 1
               fi
             done
+
+            # ---- Preflight: model checksums (embeddings are only valid for these exact files) ----
+            cd "$APP_DIR/models"
+            if ! sha256sum -c - <<'SUMS'
+            041f73f47371333d1d17a6fee6c8ab4e6aecabefe398ff32cca4e2d5eaee0af9  scrfd_2.5g_bnkps.onnx
+            9cc6e4a75f0e2bf0b1aed94578f144d15175f357bdc05e815e5c4a02b319eb4f  w600k_mbf.onnx
+            SUMS
+            then
+              echo "ERROR: model checksum mismatch - aborting; existing container left running."
+              exit 1
+            fi
+            cd "$APP_DIR"
 
             echo "Logging in to Docker Hub on VPS..."
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
@@ -86,35 +104,73 @@ jobs:
             echo "Pulling image: ${IMAGE}"
             docker pull "${IMAGE}"
 
-            echo "Stopping/removing existing container if present..."
-            if [ "$(docker ps -aq -f name="^${CONTAINER_NAME}$")" ]; then
-              docker rm -f "${CONTAINER_NAME}" || true
-            fi
+            # Image reference (for the record) and immutable image ID (for restoring).
+            PREVIOUS_IMAGE="$(docker inspect --format '{{.Config.Image}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+            PREVIOUS_IMAGE_ID="$(docker inspect --format '{{.Image}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+            echo "Previous image: ${PREVIOUS_IMAGE:-<none>} ${PREVIOUS_IMAGE_ID}"
 
-            echo "Starting new container..."
-            docker run -d \
-              --name "${CONTAINER_NAME}" \
-              --restart unless-stopped \
-              -p 6900:6900 \
-              --env-file "$ENV_FILE" \
-              -v "$APP_DIR/data:/code/data" \
-              -v "$APP_DIR/models:/code/models:ro" \
-              -v "$APP_DIR/firebase_service.json:/code/firebase_service.json:ro" \
-              "${IMAGE}"
+            run_container() {
+              docker run -d \
+                --name "${CONTAINER_NAME}" \
+                --restart unless-stopped \
+                -p 6900:6900 \
+                --env-file "$ENV_FILE" \
+                -e UVICORN_PORT=6900 \
+                -v "$APP_DIR/data:/code/data" \
+                -v "$APP_DIR/models:/code/models:ro" \
+                -v "$APP_DIR/firebase_service.json:/code/firebase_service.json:ro" \
+                "$1"
+            }
+
+            wait_healthy() {
+              for i in $(seq 1 30); do
+                if curl -fsS http://127.0.0.1:6900/healthz >/dev/null 2>&1; then
+                  return 0
+                fi
+                sleep 2
+              done
+              return 1
+            }
+
+            echo "Replacing container..."
+            docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+            run_container "${IMAGE}"
 
             echo "Waiting for /healthz..."
-            for i in $(seq 1 30); do
-              if curl -fsS http://127.0.0.1:6900/healthz >/dev/null 2>&1; then
-                echo "Healthy."
-                break
+            if wait_healthy; then
+              echo "Healthy."
+              if [ -n "${PREVIOUS_IMAGE_ID}" ]; then
+                echo "${PREVIOUS_IMAGE_ID} ${PREVIOUS_IMAGE}" > "$APP_DIR/previous_image"
               fi
-              if [ "$i" -eq 30 ]; then
-                echo "ERROR: service not healthy after 60s. Recent logs:"
-                docker logs --tail 50 "${CONTAINER_NAME}"
-                exit 1
+              echo "${IMAGE}" > "$APP_DIR/current_image"
+            else
+              echo "ERROR: new image not healthy after 60s. Recent logs:"
+              docker logs --tail 50 "${CONTAINER_NAME}" || true
+              docker rm -f "${CONTAINER_NAME}" || true
+              if [ -n "${PREVIOUS_IMAGE_ID}" ]; then
+                echo "Restoring previous image: ${PREVIOUS_IMAGE} ${PREVIOUS_IMAGE_ID}"
+                run_container "${PREVIOUS_IMAGE_ID}"
+                if wait_healthy; then
+                  echo "Previous image restored and healthy."
+                else
+                  echo "ERROR: previous image also unhealthy - manual attention needed."
+                fi
               fi
-              sleep 2
-            done
+              exit 1
+            fi
+
+            # Keep the 3 newest sha-* tags of this repo for rollback and untag older ones.
+            # Only this repository's image tags are touched - never volumes or other apps' images.
+            # Best effort: a cleanup problem never fails a healthy deploy.
+            {
+              docker images "${IMAGE_REPO}" --format '{{.CreatedAt}}|{{.Repository}}:{{.Tag}}' \
+                | awk -F'|' '$2 ~ /:sha-/' | sort -r | tail -n +4 | cut -d'|' -f2 \
+                | while read -r old; do
+                    if [ "$old" != "${IMAGE}" ] && [ "$old" != "${PREVIOUS_IMAGE}" ]; then
+                      docker rmi "$old" || true
+                    fi
+                  done
+            } || true
 
             # Only remove dangling images - never volumes (other apps share this VPS)
             docker image prune -f || true
@@ -126,3 +182,4 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           REGISTRY: docker.io
           IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/face-recognition-api
+          GIT_SHA: ${{ github.sha }}

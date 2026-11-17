@@ -1,65 +1,75 @@
 # syntax=docker/dockerfile:1.7
-FROM python:3.11-slim-bookworm
+#
+# Multi-stage build:
+#   builder - compiles/installs locked dependencies into /opt/venv (needs a C++ toolchain for insightface)
+#   runtime - slim image with only the venv, the app code and two shared libraries
+#
+# Models, data and credentials are NOT in the image; they are mounted at runtime
+# (see .github/workflows/attendance.yml).
 
-# ---- Environment & runtime tuning ----
+# python:3.13.18-slim-bookworm, pinned by digest for reproducible builds.
+ARG PYTHON_IMAGE=python:3.13.18-slim-bookworm@sha256:a5a7017efc5969e00ae2b91c8eb0631049a569652aa4ffc4501769049ae45c72
+
+# ─────────────────────────────── builder ───────────────────────────────
+FROM ${PYTHON_IMAGE} AS builder
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential g++ \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/venv
+
+RUN python -m pip install uv==0.13.8
+
+WORKDIR /build
+COPY pyproject.toml uv.lock .python-version ./
+# --frozen: install exactly what uv.lock pins; fail if the lock is out of date.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
+
+# ─────────────────────────────── runtime ───────────────────────────────
+FROM ${PYTHON_IMAGE} AS runtime
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
+    PATH=/opt/venv/bin:$PATH \
     UVICORN_HOST=0.0.0.0 \
-    UVICORN_PORT=8000
+    UVICORN_PORT=6900
 
-# Non-root user
+# libglib2.0-0: OpenCV; libgomp1: ONNX Runtime / OpenMP
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libglib2.0-0 libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+
 ARG APP_USER=app
 ARG APP_GROUP=app
 ARG APP_UID=10001
 RUN addgroup --system ${APP_GROUP} \
- && adduser  --system --uid ${APP_UID} --ingroup ${APP_GROUP} --home /home/${APP_USER} ${APP_USER}
-
-# Caches
+ && adduser --system --uid ${APP_UID} --ingroup ${APP_GROUP} --home /home/${APP_USER} ${APP_USER}
 ENV HOME=/home/${APP_USER} \
-    XDG_CACHE_HOME=/home/${APP_USER}/.cache \
-    TORCH_HOME=/home/${APP_USER}/.cache/torch
-RUN mkdir -p "$XDG_CACHE_HOME" "$TORCH_HOME"
+    XDG_CACHE_HOME=/home/${APP_USER}/.cache
+
+COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /code
+COPY --chown=${APP_USER}:${APP_GROUP} app/ /code/app/
 
-# ---- Copy only requirements first (better caching) ----
-COPY requirements.txt .
-
-# ---- Build & runtime system deps ----
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential g++ cmake \
-      libgl1 libglib2.0-0 libsm6 libxext6 ffmpeg \
- && rm -rf /var/lib/apt/lists/*
-
-# ---- Python deps ----
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python -m pip install --upgrade pip setuptools wheel && \
-    python -m pip install -r requirements.txt
-
-# Optional: slim the image
-RUN apt-get purge -y --auto-remove build-essential g++ cmake || true && \
-    rm -rf /var/lib/apt/lists/*
-
-# ---- App code ----
-# Copy source code and models, making sure permissions belong to the app user
-COPY --chown=${APP_USER}:${APP_GROUP} . /code
-# If you want to be explicit (no-op if already present in repo):
-# COPY --chown=${APP_USER}:${APP_GROUP} models/ /code/models/
-
-# ---- Ensure runtime dirs exist & are writable by the non-root user ----
-# Create /code/data and a default faces subdir so imports that mkdir won't fail
-RUN mkdir -p /code/data/faces /code/models \
- && chown -R ${APP_USER}:${APP_GROUP} /code /home/${APP_USER}
+# Mount points; real content comes from host volumes.
+RUN mkdir -p /code/data/faces /code/models "$XDG_CACHE_HOME" \
+ && chown -R ${APP_USER}:${APP_GROUP} /code/data /code/models /home/${APP_USER}
 
 USER ${APP_USER}
 
-EXPOSE 8000
+EXPOSE 6900
 
-# Basic liveness check (adjust path if your API differs)
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 \
   CMD python -c "import os,urllib.request as u,sys; \
-    sys.exit(0 if u.urlopen('http://127.0.0.1:%s/healthz' % os.getenv('UVICORN_PORT','8000'), timeout=3).status == 200 else 1)" || exit 1
+    sys.exit(0 if u.urlopen('http://127.0.0.1:%s/healthz' % os.getenv('UVICORN_PORT','6900'), timeout=3).status == 200 else 1)" || exit 1
 
-# Start FastAPI
-CMD uvicorn app.api.server:app --host ${UVICORN_HOST} --port ${UVICORN_PORT}
+# exec so uvicorn is PID 1 and receives SIGTERM for graceful shutdown.
+CMD ["sh", "-c", "exec uvicorn app.api.server:app --host \"$UVICORN_HOST\" --port \"$UVICORN_PORT\""]

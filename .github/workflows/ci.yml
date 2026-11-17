@@ -1,7 +1,7 @@
 name: CI
 
-# Quality checks only. This workflow never builds images or deploys;
-# production deployment stays manual via attendance.yml.
+# Quality checks only. This workflow builds the image locally to verify it,
+# but never pushes or deploys; production deployment stays manual via attendance.yml.
 on:
   push:
   pull_request:
@@ -12,6 +12,9 @@ permissions:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.13.8"
 
 jobs:
   test:
@@ -24,24 +27,21 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
+          python-version-file: ".python-version"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Install uv
+        run: python -m pip install "uv==${UV_VERSION}"
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
 
       - name: Run tests
-        run: python -m pytest -q
+        run: uv run --frozen pytest -q
 
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Non-blocking until existing findings are fixed (see docs/MODERNIZATION_PLAN.md, PR 2).
+    # Non-blocking until existing findings are fixed (see docs/MODERNIZATION_PLAN.md).
     continue-on-error: true
     steps:
       - name: Checkout
@@ -50,10 +50,66 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Install Ruff
-        run: python -m pip install ruff==0.17.5
+          python-version-file: ".python-version"
 
       - name: Ruff check
-        run: ruff check app tests
+        run: |
+          python -m pip install "uv==${UV_VERSION}"
+          uvx ruff@0.17.5 check app tests scripts
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Report-only for now; becomes blocking once the baseline is clean.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: pip-audit on locked runtime dependencies
+        run: |
+          python -m pip install "uv==${UV_VERSION}"
+          uv export --frozen --no-dev --no-hashes --no-emit-project -o runtime-requirements.txt
+          uvx pip-audit -r runtime-requirements.txt --no-deps --progress-spinner off
+
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: face-recognition-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test image
+        run: |
+          docker run --rm --entrypoint python face-recognition-api:ci -c "
+          import sys, cv2, numpy, onnxruntime, insightface, fastapi, app.config
+          print(sys.version.split()[0], 'cv2', cv2.__version__, 'ort', onnxruntime.__version__)
+          "
+          # No biometric samples, data or tests may be baked into the image.
+          docker run --rm --entrypoint sh face-recognition-api:ci -c '
+            set -e
+            ls /code
+            test ! -e /code/tests
+            test -z "$(find /code -name "*.jpeg" -o -name "*.jpg" -o -name "*.pkl")"
+            test "$(id -u)" = "10001"
+            test "$UVICORN_PORT" = "6900"
+          '

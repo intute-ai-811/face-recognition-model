@@ -1,0 +1,103 @@
+name: Rollback VPS deployment
+
+# Manual only. Restarts the container on a previously deployed image without building.
+# Default target: the image recorded in ~/face-recognition-model/previous_image by the
+# last successful deploy. Or pass an explicit image tag/ID (e.g. sha-<commit> or sha256:...).
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Image to roll back to (blank = previous successful deploy). Examples: sha-<full commit>, sha256:<image id>"
+        required: false
+        default: ""
+
+concurrency:
+  group: face-recognition-api
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Roll back on VPS via SSH
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: 22
+          script_stop: true
+          envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,REGISTRY,IMAGE_NAME,TARGET
+          script: |
+            set -eo pipefail
+
+            IMAGE_REPO="${REGISTRY}/${IMAGE_NAME}"
+            CONTAINER_NAME="face-recognition-api"
+            APP_DIR="$HOME/face-recognition-model"
+            ENV_FILE="$APP_DIR/app.env"
+
+            if [ -z "${TARGET}" ]; then
+              if [ ! -s "$APP_DIR/previous_image" ]; then
+                echo "ERROR: no image given and $APP_DIR/previous_image is missing - nothing to roll back to."
+                exit 1
+              fi
+              TARGET="$(cut -d' ' -f1 "$APP_DIR/previous_image")"
+            elif [ "${TARGET#sha256:}" = "${TARGET}" ]; then
+              TARGET="${IMAGE_REPO}:${TARGET}"
+            fi
+            echo "Rolling back to: ${TARGET}"
+
+            if ! docker image inspect "${TARGET}" >/dev/null 2>&1; then
+              echo "Image not present locally - pulling..."
+              echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+              docker pull "${TARGET}"
+            fi
+
+            CURRENT_IMAGE_ID="$(docker inspect --format '{{.Image}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+
+            run_container() {
+              docker run -d \
+                --name "${CONTAINER_NAME}" \
+                --restart unless-stopped \
+                -p 6900:6900 \
+                --env-file "$ENV_FILE" \
+                -e UVICORN_PORT=6900 \
+                -v "$APP_DIR/data:/code/data" \
+                -v "$APP_DIR/models:/code/models:ro" \
+                -v "$APP_DIR/firebase_service.json:/code/firebase_service.json:ro" \
+                "$1"
+            }
+
+            wait_healthy() {
+              for i in $(seq 1 30); do
+                if curl -fsS http://127.0.0.1:6900/healthz >/dev/null 2>&1; then
+                  return 0
+                fi
+                sleep 2
+              done
+              return 1
+            }
+
+            docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+            run_container "${TARGET}"
+            if wait_healthy; then
+              echo "Rollback healthy."
+              echo "${TARGET}" > "$APP_DIR/current_image"
+            else
+              echo "ERROR: rollback target not healthy. Recent logs:"
+              docker logs --tail 50 "${CONTAINER_NAME}" || true
+              if [ -n "${CURRENT_IMAGE_ID}" ]; then
+                docker rm -f "${CONTAINER_NAME}" || true
+                echo "Restarting the image that was running before: ${CURRENT_IMAGE_ID}"
+                run_container "${CURRENT_IMAGE_ID}"
+              fi
+              exit 1
+            fi
+            docker ps --filter "name=${CONTAINER_NAME}"
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          REGISTRY: docker.io
+          IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/face-recognition-api
+          TARGET: ${{ inputs.image }}
