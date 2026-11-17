@@ -4,8 +4,6 @@ import pytest
 
 from app import config
 
-pytest.importorskip("insightface")
-pytest.importorskip("cv2")
 
 from app.core.detector import FaceDetector  # noqa: E402
 from app.core.recognize import Pipeline  # noqa: E402

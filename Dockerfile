@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 #
 # Multi-stage build:
-#   builder - compiles/installs locked dependencies into /opt/venv (needs a C++ toolchain for insightface)
+#   builder - installs locked dependencies (prebuilt wheels only) into /opt/venv
 #   runtime - slim image with only the venv, the app code and two shared libraries
 #
 # Models, data and credentials are NOT in the image; they are mounted at runtime
@@ -12,10 +12,6 @@ ARG PYTHON_IMAGE=python:3.13.18-slim-bookworm@sha256:a5a7017efc5969e00ae2b91c8eb
 
 # ─────────────────────────────── builder ───────────────────────────────
 FROM ${PYTHON_IMAGE} AS builder
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential g++ \
- && rm -rf /var/lib/apt/lists/*
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -29,8 +25,9 @@ RUN python -m pip install uv==0.13.8
 WORKDIR /build
 COPY pyproject.toml uv.lock .python-version ./
 # --frozen: install exactly what uv.lock pins; fail if the lock is out of date.
+# --no-build: wheels only - never compile from source inside the image build.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project
+    uv sync --frozen --no-dev --no-install-project --no-build
 
 # ─────────────────────────────── runtime ───────────────────────────────
 FROM ${PYTHON_IMAGE} AS runtime

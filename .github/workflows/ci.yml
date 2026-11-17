@@ -101,7 +101,7 @@ jobs:
       - name: Smoke test image
         run: |
           docker run --rm --entrypoint python face-recognition-api:ci -c "
-          import sys, cv2, numpy, onnxruntime, insightface, fastapi, app.config
+          import sys, cv2, numpy, onnxruntime, fastapi, app.config, app.core.detector, app.core.embedder
           print(sys.version.split()[0], 'cv2', cv2.__version__, 'ort', onnxruntime.__version__)
           "
           # No biometric samples, data or tests may be baked into the image.
