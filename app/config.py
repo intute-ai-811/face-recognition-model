@@ -16,6 +16,11 @@ PEOPLE_FILE: Path = DATA_DIR / "people.pkl"
 SCRFD_MODEL: Path = Path(os.getenv("SCRFD_MODEL", str(MODELS_DIR / "scrfd_2.5g_bnkps.onnx")))
 MOBILEFACENET_MODEL: Path = Path(os.getenv("MOBILEFACENET_MODEL", str(MODELS_DIR / "w600k_mbf.onnx")))
 ORT_PROVIDERS: list[str] = ["CPUExecutionProvider"]
+# Embedder input normalisation, (pixel - mean) / std. 127.5 / 127.5 is what
+# insightface chose for w600k_mbf (no normalisation nodes in its graph).
+# A different model may need different values; verify with the golden test.
+EMBED_INPUT_MEAN: float = 127.5
+EMBED_INPUT_STD: float = 127.5
 
 # ── Detection & Alignment ────────────────────────────────────────────────────
 DET_SCORE_THRESH: float = 0.45

@@ -44,7 +44,6 @@ def test_embeddings_match_golden(golden):
     model = Path(config.MOBILEFACENET_MODEL)
     if not model.exists():
         pytest.skip(f"model not present at {model}")
-    pytest.importorskip("insightface")
     assert _sha256(model) == str(golden["model_sha256"]), (
         "Different model file than the golden was generated with. "
         "A model change needs a new golden and a re-enrollment plan (see docs/MODERNIZATION_PLAN.md)."

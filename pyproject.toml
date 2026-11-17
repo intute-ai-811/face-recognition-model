@@ -11,8 +11,6 @@ dependencies = [
     "numpy>=2.1,<3",
     "opencv-python-headless>=4.12,<5",
     "onnxruntime>=1.32,<2",
-    # Used at runtime for SCRFD/ArcFace wrappers until PR 6 replaces them.
-    "insightface==0.7.3",
     "aiohttp>=3.14.4",
     "firebase-admin>=7.1",
     "pillow>=13.0",

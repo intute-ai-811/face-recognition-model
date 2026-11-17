@@ -53,6 +53,28 @@ Synthetic random embeddings, 10 templates per person, one query, the current `se
 
 Raw results: `benchmarks/results/baseline-dev-2026-11-17.json`, `benchmarks/results/shift-change-dev-2026-11-17.csv`.
 
+## PR 6: insightface removed, warm-up, thread setting
+
+Detection and embedding now run on in-house ONNX Runtime wrappers; `insightface` and about 30 packages are gone. Outputs are unchanged:
+
+| Check | Result |
+| --- | --- |
+| `tests/test_detector_equivalence.py` (vs insightface 0.7.3) | boxes, scores, landmarks within 1e-3 px; embeddings within 1e-5 |
+| Golden embeddings | pass without insightface installed |
+| `scripts/pipeline_snapshot.py` vs the original production stack (Python 3.11 + insightface) | identical within 1.2e-7; `test.jpg` 0.575 |
+
+**Warm-up** (`MODEL_WARMUP=1`, default): the first request after startup took 33 ms instead of 64 ms.
+
+**ONNX Runtime threads under a 50-user burst** (same load test as above, 30 s, dev machine):
+
+| `ORT_INTRA_OP_THREADS` | Requests | Failures | Throughput | p50 | p95 | p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| unset (ORT default = all cores) | 702 | 0 | 24.2 req/s | 120 ms | 480 ms | 730 ms |
+| 4 | 735 | 0 | 25.4 req/s | 40 ms | 320 ms | 390 ms |
+| 2 | 712 | 0 | 24.6 req/s | 60 ms | 310 ms | 380 ms |
+
+**Reading:** with many requests in flight, letting each inference use every core makes them fight over the CPU. Capping threads per inference cut the median about 3x and the p99 about 2x here, with the same throughput. The default is left unchanged because the VPS CPU is different. To adopt it, run the load test on the VPS with a few values and then set the best one in `app.env` (e.g. `ORT_INTRA_OP_THREADS=2` on a 2–4 vCPU VPS). No code change or rebuild is needed.
+
 ## Accuracy (pending kiosk dataset)
 
 `benchmarks/eval_accuracy.py` is ready but has not been run on real kiosk data. Smoke test on the repository's sample photos (1 person, 2 enrollment images, 2 probes, no impostors): TAR 1.0 at 0.50, genuine scores 0.53–0.81. That is far too small to mean anything; it only shows the script works end to end.

@@ -1,5 +1,6 @@
 #app/core/recognize.py
 import logging
+import os
 import numpy as np
 from app.core.detector import FaceDetector
 from app.core.align import align_5pts
@@ -16,6 +17,14 @@ class Pipeline:
         self.det = FaceDetector()
         self.emb = FaceEmbedder()
         self.db = LocalStore()
+        if os.getenv("MODEL_WARMUP", "1") == "1":
+            self.warmup()
+
+    def warmup(self):
+        """Run each model once on blank input so the first real request is not slowed by lazy initialisation."""
+        with timed(log, "model_warmup"):
+            self.det.detect(np.zeros((640, 640, 3), np.uint8))
+            self.emb.embed([np.zeros((config.ALIGNED_SIZE, config.ALIGNED_SIZE, 3), np.uint8)])
 
     def enroll_image(self, img, person_id, source):
         """
