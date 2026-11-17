@@ -106,22 +106,41 @@ async def test_register_returns_400_when_no_valid_images_enrolled(server_module,
 @pytest.mark.asyncio
 async def test_register_success_200(server_module, monkeypatch, dummy_img):
     """
-    Decode ok + default DummyPipeline enroll_image adds embeddings => 200.
+    Decode ok + DummyPipeline adds 1 embedding per image. Enrollment needs
+    ENROLL_MIN_GOOD_EMBEDDINGS embeddings, so send exactly that many images => 200.
     """
     rid = "rid-reg-200"
     monkeypatch.setattr(server_module.cv2, "imdecode", lambda arr, mode: dummy_img)
+    from app import config
+    n = config.ENROLL_MIN_GOOD_EMBEDDINGS
 
     async with make_async_client(server_module.app) as ac:
         r = await ac.post(
             "/register",
             headers={"X-Request-ID": rid},
             data={"user_id": "u1", "name": "Test"},
-            files=[("files", ("img.jpg", b"fakebytes", "image/jpeg"))],
+            files=[("files", (f"img{i}.jpg", b"fakebytes", "image/jpeg")) for i in range(n)],
         )
         assert r.status_code == 200
         body = r.json()
         assert body["ok"] is True
+        assert body["embeddings_added"] == n
         assert body["request_id"] == rid
+
+
+@pytest.mark.asyncio
+async def test_register_below_minimum_embeddings_400(server_module, monkeypatch, dummy_img):
+    """One good image (1 embedding) is below ENROLL_MIN_GOOD_EMBEDDINGS => insufficient_enrollment."""
+    monkeypatch.setattr(server_module.cv2, "imdecode", lambda arr, mode: dummy_img)
+
+    async with make_async_client(server_module.app) as ac:
+        r = await ac.post(
+            "/register",
+            data={"user_id": "u1", "name": "Test"},
+            files=[("files", ("img.jpg", b"fakebytes", "image/jpeg"))],
+        )
+        assert r.status_code == 400
+        assert r.json()["status"] == "insufficient_enrollment"
 
 
 @pytest.mark.asyncio

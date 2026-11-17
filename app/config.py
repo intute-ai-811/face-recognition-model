@@ -19,6 +19,8 @@ ORT_PROVIDERS: list[str] = ["CPUExecutionProvider"]
 
 # ── Detection & Alignment ────────────────────────────────────────────────────
 DET_SCORE_THRESH: float = 0.45
+# Softer detection threshold used only for enrollment images.
+ENROLL_DET_SCORE_THRESH: float = 0.35
 DET_NMS_THRESH: float = 0.45
 ALIGNED_SIZE: int = 112
 EMB_DIM: int = 512
