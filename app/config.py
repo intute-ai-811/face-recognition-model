@@ -59,3 +59,9 @@ ERP_ATTENDANCE_URL: str = os.getenv(
     "ERP_ATTENDANCE_URL",
     "https://j7lo9j074j.execute-api.ap-south-1.amazonaws.com/attendanceConfirmation",
 )
+# One quick retry when the ERP is unreachable or answers 502/503/504. Timeouts are not
+# retried (the kiosk would wait twice). Safe because the ERP answers duplicates with
+# already_checked_in / already_checked_out. ERP_RETRIES=0 restores the old behaviour.
+ERP_RETRIES: int = int(os.getenv("ERP_RETRIES", "1"))
+ERP_RETRY_BACKOFF_S: float = float(os.getenv("ERP_RETRY_BACKOFF_S", "0.5"))
+ERP_RETRY_STATUSES: frozenset = frozenset({502, 503, 504})

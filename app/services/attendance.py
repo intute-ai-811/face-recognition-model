@@ -7,6 +7,7 @@ tests/test_api_contract.py).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -78,6 +79,34 @@ def _error(code: int, rid: str, status: str, message: str, best: dict | None = N
     return JSONResponse(status_code=code, content=content)
 
 
+def _retry_reason(status, resp) -> str | None:
+    if status is None and isinstance(resp, dict) and resp.get("error_kind") == "connect":
+        return "connect"
+    if status in getattr(config, "ERP_RETRY_STATUSES", ()):
+        return "status_5xx"
+    return None
+
+
+async def post_erp_with_retry(payload: dict, action: AttendanceAction, rid: str):
+    """
+    POST to the ERP, retrying up to ERP_RETRIES times on connection errors and 502/503/504.
+    Not retried: timeouts, other statuses, success. Duplicates are safe: the ERP answers
+    a repeated check-in/out with already_checked_in / already_checked_out.
+    """
+    retries = max(0, int(getattr(config, "ERP_RETRIES", 0)))
+    backoff = float(getattr(config, "ERP_RETRY_BACKOFF_S", 0.5))
+    attempt = 0
+    while True:
+        status, resp = await erp_http.post_json(config.ERP_ATTENDANCE_URL, payload)
+        reason = _retry_reason(status, resp)
+        if reason is None or attempt >= retries:
+            return status, resp
+        attempt += 1
+        metrics.ERP_RETRIES.labels(action.metric, reason).inc()
+        log.warning("erp_retry", extra={"request_id": rid, "attempt": attempt, "reason": reason, "status": status})
+        await asyncio.sleep(backoff * attempt)
+
+
 async def recognize_and_report(pipe, rid: str, file: UploadFile, action: AttendanceAction):
     max_bytes = getattr(config, "MAX_UPLOAD_BYTES", 5 * 1024 * 1024)
     verb_lower = action.verb.lower()
@@ -144,7 +173,7 @@ async def recognize_and_report(pipe, rid: str, file: UploadFile, action: Attenda
 
         erp_start = time.perf_counter()
         try:
-            status, resp = await erp_http.post_json(config.ERP_ATTENDANCE_URL, payload)
+            status, resp = await post_erp_with_retry(payload, action, rid)
             metrics.ERP_REQUEST_SECONDS.labels(action.metric).observe(time.perf_counter() - erp_start)
             log.info(
                 action.sent_event,

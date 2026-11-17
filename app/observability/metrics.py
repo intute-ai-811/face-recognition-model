@@ -35,6 +35,9 @@ ERP_REQUEST_SECONDS = Histogram(
 ERP_FAILURES = Counter(
     "face_api_erp_failures_total", "ERP calls that raised or returned non-2xx", ["action", "kind"]  # kind: exception|status
 )
+ERP_RETRIES = Counter(
+    "face_api_erp_retries_total", "ERP calls retried after a transient failure", ["action", "reason"]  # reason: connect|status_5xx
+)
 
 # Enrollment
 ENROLLMENT_OUTCOMES = Counter(
