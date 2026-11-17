@@ -1,6 +1,8 @@
 # Ignore Python bytecode and caches
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
 
 # Ignore Python virtual environments
 venv/
@@ -41,7 +43,6 @@ lib/
 share/
 bin/
 
-tests/
 # Firebase credentials / config (never commit)
 firebase_service.json
 google-services.json
