@@ -54,9 +54,31 @@ class KVFormatter(logging.Formatter):
 _handler = logging.StreamHandler(sys.stdout)
 _handler.setFormatter(KVFormatter())
 
+
+class JSONFormatter(logging.Formatter):
+    """One JSON object per line (LOG_FORMAT=json), for log shippers. Same fields as the key=value format."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json
+
+        out = {
+            "ts": datetime.fromtimestamp(record.created).astimezone().isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for k, v in record.__dict__.items():
+            if k not in STANDARD_ATTRS and k not in out and k not in ("message", "asctime", "taskName"):
+                out[k] = v
+        if record.exc_info:
+            out["exc"] = self.formatException(record.exc_info)
+        return json.dumps(out, default=str, ensure_ascii=False)
+
+
 def setup_logging():
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
+    _handler.setFormatter(JSONFormatter() if os.getenv("LOG_FORMAT", "kv").lower() == "json" else KVFormatter())
 
     # safer than handlers.clear()
     for h in list(logging.root.handlers):

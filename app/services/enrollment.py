@@ -12,6 +12,7 @@ from starlette.concurrency import run_in_threadpool
 from app import config
 from app.api.uploads import decode_image, read_upload_capped
 from app.infrastructure.firebase import FirebaseClient, encode_debug_jpg
+from app.observability import metrics
 
 log = logging.getLogger("app.api.server")
 
@@ -28,11 +29,13 @@ async def enroll_person(
     person_id = str(user_id).strip()
 
     if not person_id:
+        metrics.ENROLLMENT_OUTCOMES.labels("rejected").inc()
         return JSONResponse(
             status_code=400,
             content={"status": "error", "request_id": rid, "message": "user_id required"},
         )
     if not files:
+        metrics.ENROLLMENT_OUTCOMES.labels("rejected").inc()
         return JSONResponse(
             status_code=400,
             content={"status": "error", "request_id": rid, "message": "No files[] received"},
@@ -59,10 +62,12 @@ async def enroll_person(
             raw = await read_upload_capped(f, max_bytes)
             if not raw:
                 errors += 1
+                metrics.ENROLLMENT_IMAGES.labels("empty").inc()
                 log.warning("register_empty_file", extra={"request_id": rid, "idx": i})
                 continue
             if len(raw) > max_bytes:
                 errors += 1
+                metrics.ENROLLMENT_IMAGES.labels("too_large").inc()
                 log.warning("register_file_too_large", extra={"request_id": rid, "idx": i, "bytes": len(raw)})
                 continue
 
@@ -71,6 +76,7 @@ async def enroll_person(
             img = await run_in_threadpool(decode_image, raw)
             if img is None:
                 errors += 1
+                metrics.ENROLLMENT_IMAGES.labels("undecodable").inc()
                 log.warning("register_decode_fail", extra={"request_id": rid, "idx": i})
                 continue
 
@@ -80,6 +86,7 @@ async def enroll_person(
             total_faces += faces
             total_emb += embs
             processed += 1
+            metrics.ENROLLMENT_IMAGES.labels("embedded" if embs else "no_embedding").inc()
 
             if firebase.enabled and firebase.initialized and ((i <= 5) or faces == 0 or embs == 0):
                 debug_bytes = encode_debug_jpg(img, max_w=640, quality=80)
@@ -92,6 +99,7 @@ async def enroll_person(
 
         except Exception as e:
             errors += 1
+            metrics.ENROLLMENT_IMAGES.labels("error").inc()
             log.exception("register_frame_error", extra={"request_id": rid, "idx": i, "error": str(e)})
 
     summary = {
@@ -109,12 +117,14 @@ async def enroll_person(
     log.info("api_register_out", extra={k: v for k, v in summary.items() if k != "person_name"})
 
     if total_emb == 0:
+        metrics.ENROLLMENT_OUTCOMES.labels("no_valid_images").inc()
         return JSONResponse(
             status_code=400,
             content={"status": "error", "request_id": rid, "message": "No valid images were enrolled.", "details": summary},
         )
 
     if total_emb < config.ENROLL_MIN_GOOD_EMBEDDINGS:
+        metrics.ENROLLMENT_OUTCOMES.labels("insufficient").inc()
         return JSONResponse(
             status_code=400,
             content={
@@ -129,4 +139,5 @@ async def enroll_person(
             },
         )
 
+    metrics.ENROLLMENT_OUTCOMES.labels("enrolled").inc()
     return summary

@@ -18,6 +18,7 @@ import numpy as np
 from app import config
 from app.core.ort_session import create_session
 from app.logging_config import get_logger, timed
+from app.observability.metrics import PIPELINE_STAGE_SECONDS
 
 log = get_logger(__name__)
 
@@ -179,7 +180,7 @@ class FaceDetector:
             raise ValueError(
                 f"min_score={thresh} is below the detector floor {self.native_thresh}"
             )
-        with timed(log, "detect_infer"):
+        with timed(log, "detect_infer"), PIPELINE_STAGE_SECONDS.labels("detect").time():
             bboxes, kps = self.detector.detect(img_bgr)
         if bboxes is None or len(bboxes) == 0:
             log.info("detect_out", extra={"faces": 0})

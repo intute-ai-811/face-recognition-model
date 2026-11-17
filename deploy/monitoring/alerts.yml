@@ -1,0 +1,54 @@
+# Prometheus alerting rules for the face recognition attendance API.
+# Load with `rule_files: [alerts.yml]` in prometheus.yml. Job name assumed: face-api.
+groups:
+  - name: face-api
+    rules:
+      - alert: FaceApiDown
+        expr: up{job="face-api"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Face API not reachable for 2 minutes"
+          runbook: "docker ps / docker logs face-recognition-api; the rollback workflow restores the previous image"
+
+      - alert: FaceApiNoEnrollmentsLoaded
+        expr: face_api_store_embeddings == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "No enrolled faces loaded - everyone will be 'unknown'"
+          runbook: "Check the data/ volume mount and STORAGE_BACKEND; do NOT re-enroll before checking backups"
+
+      - alert: FaceApiHighErrorRate
+        expr: |
+          sum(rate(face_api_http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(face_api_http_requests_total[5m])), 1e-9) > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "More than 5% of requests failing with 5xx"
+
+      - alert: FaceApiErpFailures
+        expr: increase(face_api_erp_failures_total[10m]) > 3
+        labels: {severity: warning}
+        annotations:
+          summary: "Faces recognised but the ERP call failed - attendance is not being recorded"
+
+      - alert: FaceApiSlowRecognition
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(face_api_http_request_seconds_bucket{route=~"/mark_attendance|/logout"}[5m]))) > 2
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "p95 attendance request slower than 2 s"
+          runbook: "Check CPU on the VPS; consider ORT_INTRA_OP_THREADS (docs/benchmarks.md)"
+
+      - alert: FaceApiMostlyNoFace
+        expr: |
+          sum(increase(face_api_attendance_outcomes_total{outcome="no_face"}[30m]))
+            / clamp_min(sum(increase(face_api_attendance_outcomes_total[30m])), 1) > 0.5
+          and sum(increase(face_api_attendance_outcomes_total[30m])) > 10
+        labels: {severity: info}
+        annotations:
+          summary: "Most kiosk photos contain no detectable face - camera blocked, dark or misaimed?"
