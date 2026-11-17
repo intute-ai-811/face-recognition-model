@@ -65,7 +65,8 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           password: ${{ secrets.VPS_PASSWORD }}
           port: 22
-          script_stop: true
+          # No script_stop: v0.1.7 injects an exit check after every line (it broke the
+          # checksum heredoc). The script's own 'set -eo pipefail' already stops on errors.
           envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,REGISTRY,IMAGE_NAME,GIT_SHA
           script: |
             set -eo pipefail
@@ -88,11 +89,11 @@ jobs:
 
             # ---- Preflight: model checksums (embeddings are only valid for these exact files) ----
             cd "$APP_DIR/models"
-            if ! sha256sum -c - <<'SUMS'
-            041f73f47371333d1d17a6fee6c8ab4e6aecabefe398ff32cca4e2d5eaee0af9  scrfd_2.5g_bnkps.onnx
-            9cc6e4a75f0e2bf0b1aed94578f144d15175f357bdc05e815e5c4a02b319eb4f  w600k_mbf.onnx
-            SUMS
-            then
+            # One line on purpose: no heredoc, so nothing can be injected between checksum lines.
+            if ! printf '%s  %s\n' \
+                041f73f47371333d1d17a6fee6c8ab4e6aecabefe398ff32cca4e2d5eaee0af9 scrfd_2.5g_bnkps.onnx \
+                9cc6e4a75f0e2bf0b1aed94578f144d15175f357bdc05e815e5c4a02b319eb4f w600k_mbf.onnx \
+                | sha256sum --strict -c -; then
               echo "ERROR: model checksum mismatch - aborting; existing container left running."
               exit 1
             fi
